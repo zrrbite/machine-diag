@@ -619,6 +619,58 @@ function Get-BenchmarkResults {
     }
 }
 
+# ---------- Defender performance trace (optional, -DefenderTrace) ----------
+
+function Format-DefenderTraceEvidence {
+    param([object[]]$TopFiles = @(), [object[]]$TopProcesses = @(), [object[]]$TopExtensions = @())
+    if (@($TopFiles).Count -eq 0 -and @($TopProcesses).Count -eq 0 -and @($TopExtensions).Count -eq 0) {
+        , @('Defender recorded no scan activity during the benchmark window.')
+    } else {
+        $evidence = @()
+        foreach ($f in $TopFiles) {
+            $evidence += "Scanned file: $($f.Path) - $([math]::Round($f.TotalDurationMs)) ms total scan time"
+        }
+        foreach ($p in $TopProcesses) {
+            $evidence += "Scanned on behalf of process: $($p.ProcessPath) - $([math]::Round($p.TotalDurationMs)) ms"
+        }
+        foreach ($e in $TopExtensions) {
+            $evidence += "Extension $($e.Extension) - $([math]::Round($e.TotalDurationMs)) ms"
+        }
+        $evidence
+    }
+}
+
+function Get-DefenderTraceResults {
+    if (-not (Get-Command New-MpPerformanceRecording -ErrorAction SilentlyContinue)) {
+        throw 'New-MpPerformanceRecording not available (needs Windows 10 2004+ with Defender)'
+    }
+    $etl = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-defender-$PID.etl"
+    $benchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-trace-bench-$PID"
+    New-Item -ItemType Directory -Path $benchRoot -Force | Out-Null
+    try {
+        Write-Host 'Recording Defender activity for 30 s while re-running the file benchmark...' -ForegroundColor Cyan
+        $job = Start-Job -ScriptBlock {
+            param($ScriptPath, $Dir, $Count)
+            . $ScriptPath -LibraryMode
+            Invoke-SmallFileBenchmark -WorkDir $Dir -FileCount $Count | Out-Null
+        } -ArgumentList $PSCommandPath, $benchRoot, $BenchFileCount
+        New-MpPerformanceRecording -RecordTo $etl -Seconds 30
+        Wait-Job $job -Timeout 60 | Out-Null
+        Remove-Job $job -Force
+        $report = Get-MpPerformanceReport -Path $etl -TopFiles 5 -TopProcesses 5 -TopExtensions 5
+        $evidence = Format-DefenderTraceEvidence `
+            -TopFiles @($report.TopFiles) `
+            -TopProcesses @($report.TopProcesses) `
+            -TopExtensions @($report.TopExtensions)
+        New-DiagResult -Name 'Defender performance trace' -Category 'Security' -Severity 'Info' `
+            -Evidence $evidence `
+            -Recommendation 'This is first-party Microsoft data on what Defender spent scan time on. If build files/toolchain dominate, it directly justifies the exclusion request.'
+    } finally {
+        Remove-Item -Path $etl -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $benchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
