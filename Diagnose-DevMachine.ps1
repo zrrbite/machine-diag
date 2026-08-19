@@ -315,21 +315,26 @@ function Invoke-SmallFileBenchmark {
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     for ($i = 0; $i -lt $FileCount; $i++) {
+        # Stamp file index into first bytes of payload to make content unique;
+        # defeats AV scan-result caching so each file is scanned independently.
+        [System.BitConverter]::GetBytes($i).CopyTo($payload, 0)
         $sub = Join-Path $WorkDir ('d{0:D3}' -f ($i % $DirFanout))
         $ext = $extensions[$i % $extensions.Count]
         [System.IO.File]::WriteAllBytes((Join-Path $sub "f$i$ext"), $payload)
     }
-    $writeMs = $sw.ElapsedMilliseconds
+    $writeMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
     $sw.Restart()
-    foreach ($f in (Get-ChildItem -Path $WorkDir -Recurse -File)) {
-        [void][System.IO.File]::ReadAllBytes($f.FullName)
+    for ($d = 0; $d -lt $DirFanout; $d++) {
+        foreach ($f in (Get-ChildItem -Path (Join-Path $WorkDir ('d{0:D3}' -f $d)) -File)) {
+            [void][System.IO.File]::ReadAllBytes($f.FullName)
+        }
     }
-    $readMs = $sw.ElapsedMilliseconds
+    $readMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
     $sw.Restart()
     for ($d = 0; $d -lt $DirFanout; $d++) {
         Remove-Item -Path (Join-Path $WorkDir ('d{0:D3}' -f $d)) -Recurse -Force
     }
-    $deleteMs = $sw.ElapsedMilliseconds
+    $deleteMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
     [pscustomobject]@{
         FileCount = $FileCount
         WriteMs   = $writeMs
@@ -355,7 +360,7 @@ function Invoke-ProcessSpawnBenchmark {
         $p.WaitForExit()
         $p.Dispose()
     }
-    $totalMs = $sw.ElapsedMilliseconds
+    $totalMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
     [pscustomobject]@{
         SpawnCount = $SpawnCount
         TotalMs    = $totalMs
