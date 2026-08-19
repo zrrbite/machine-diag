@@ -1,6 +1,6 @@
 Describe 'Full run (non-Windows smoke)' {
     It 'runs end-to-end, exits 0, and writes a report with Skipped and Benchmark sections' {
-        $scriptPath = Join-Path $PSScriptRoot '..' 'Diagnose-DevMachine.ps1'
+        $scriptPath = Join-Path (Join-Path $PSScriptRoot '..') 'Diagnose-DevMachine.ps1'
         $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "diagsmoke-$PID"
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         try {

@@ -2,6 +2,24 @@ BeforeAll {
     . $PSScriptRoot/../Diagnose-DevMachine.ps1 -LibraryMode
 }
 
+Describe 'Resolve-PowerPlanName' {
+    It 'resolves a known GUID to its canonical English name even with a localized display name' {
+        $line = 'Aktiv strømstyringsplan efter GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Afbalanceret)'
+        Resolve-PowerPlanName -SchemeLine $line | Should -Be 'Balanced'
+    }
+    It 'falls back to the parenthesised display name for an unknown GUID' {
+        $line = 'Active Power Scheme GUID: 00000000-0000-0000-0000-000000000000  (Custom Plan)'
+        Resolve-PowerPlanName -SchemeLine $line | Should -Be 'Custom Plan'
+    }
+    It 'preserves nested parens in the display name via a greedy match' {
+        $line = 'Active Power Scheme GUID: 00000000-0000-0000-0000-000000000000  (HP Optimized (recommended))'
+        Resolve-PowerPlanName -SchemeLine $line | Should -Be 'HP Optimized (recommended)'
+    }
+    It 'returns unknown when there is no GUID and no parens' {
+        Resolve-PowerPlanName -SchemeLine 'no useful data here' | Should -Be 'unknown'
+    }
+}
+
 Describe 'Get-PowerPlanVerdict' {
     It 'flags Power saver as a Problem' {
         $r = @(Get-PowerPlanVerdict -PlanName 'Power saver' -ThrottleEventCount 0)

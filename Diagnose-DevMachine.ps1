@@ -185,6 +185,33 @@ function Find-SecurityAgents {
 
 # ---------- System evaluators (pure logic; unit-tested) ----------
 
+$script:PowerPlanGuidNames = @{
+    'a1841308-3541-4fab-bc81-f71556f20b4a' = 'Power saver'
+    '381b4222-f694-41f0-9685-ff5bb260df2e' = 'Balanced'
+    '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' = 'High performance'
+    'e9a42b02-d5df-448d-aa00-03f14749eb61' = 'Ultimate Performance'
+}
+
+function Resolve-PowerPlanName {
+    param([Parameter(Mandatory)][string]$SchemeLine)
+    # powercfg output is localized (Danish/German/etc.), so the display name in
+    # parens can't be matched directly. The scheme GUID is stable regardless of
+    # locale, so resolve well-known GUIDs to their canonical English name first.
+    if ($SchemeLine -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+        $guid = $Matches[1].ToLowerInvariant()
+        if ($script:PowerPlanGuidNames.ContainsKey($guid)) {
+            return $script:PowerPlanGuidNames[$guid]
+        }
+    }
+    # Unknown GUID (custom/OEM plan): fall back to the parenthesised display
+    # name. Greedy match so nested parens, e.g. '(HP Optimized (recommended))',
+    # aren't truncated at the first closing paren.
+    if ($SchemeLine -match '\((?<name>.+)\)') {
+        return $Matches['name']
+    }
+    'unknown'
+}
+
 function Get-PowerPlanVerdict {
     param([string]$PlanName = 'unknown', [int]$ThrottleEventCount = 0)
     $results = @()
@@ -379,24 +406,41 @@ function Test-IsElevated {
 
 function Get-InventoryResults {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem
-    $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+    # Sum cores/threads across ALL Win32_Processor instances (dual-socket
+    # machines report one instance per physical socket); CPU name comes from
+    # the first instance since sockets are normally identical.
+    $cpus = @(Get-CimInstance -ClassName Win32_Processor)
+    $cpuName = $cpus[0].Name
+    $totalCores = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+    $totalThreads = ($cpus | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
     $uptimeDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
     $evidence = @(
         "OS: $($os.Caption) build $($os.BuildNumber)"
-        "CPU: $($cpu.Name) ($($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads)"
+        "CPU: $cpuName ($totalCores cores / $totalThreads threads)"
         "RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GB"
         "Uptime: $uptimeDays days"
     )
-    foreach ($disk in (Get-PhysicalDisk)) {
-        $evidence += "Disk: $($disk.FriendlyName) - $($disk.MediaType), $([math]::Round($disk.Size / 1GB)) GB"
-    }
     $results = @(New-DiagResult -Name 'Machine inventory' -Category 'Inventory' -Severity 'Info' -Evidence $evidence)
     if ($uptimeDays -gt 30) {
         $results += New-DiagResult -Name 'Long uptime' -Category 'OS' -Severity 'Warning' `
             -Evidence @("Machine has not rebooted for $uptimeDays days") `
             -Recommendation 'Reboot; long uptimes accumulate leaked resources and stalled updates.'
     }
-    foreach ($vol in (Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' })) {
+    $results
+}
+
+function Get-StorageResults {
+    $results = @()
+    $diskEvidence = @()
+    foreach ($disk in (Get-PhysicalDisk)) {
+        $diskEvidence += "Disk: $($disk.FriendlyName) - $($disk.MediaType), $([math]::Round($disk.Size / 1GB)) GB"
+    }
+    if ($diskEvidence.Count -gt 0) {
+        $results += New-DiagResult -Name 'Physical disks' -Category 'Storage' -Severity 'Info' -Evidence $diskEvidence
+    }
+    # Skip volumes with a zero Size (e.g. unformatted/recovery partitions):
+    # dividing by TotalGB=0 in Get-DiskSpaceVerdict would blow up on a NaN/Inf percentage.
+    foreach ($vol in (Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and $_.Size -gt 0 })) {
         $results += Get-DiskSpaceVerdict -DriveLetter $vol.DriveLetter `
             -FreeGB ($vol.SizeRemaining / 1GB) -TotalGB ($vol.Size / 1GB)
     }
@@ -410,19 +454,38 @@ function Get-DefenderResults {
         return New-DiagResult -Name 'Defender real-time protection' -Category 'Security' -Severity 'Info' `
             -Evidence @('Real-time protection is disabled (another AV product is likely primary)')
     }
+    # AMRunningMode isn't present on older builds - probe before reading it.
+    # 'Passive Mode'/'EDR Block Mode' mean a third-party AV is the primary
+    # scanner and Defender's own exclusion gaps aren't the relevant signal.
+    if ($status.PSObject.Properties.Name -contains 'AMRunningMode') {
+        if ($status.AMRunningMode -eq 'Passive Mode' -or $status.AMRunningMode -eq 'EDR Block Mode') {
+            return New-DiagResult -Name 'Defender running mode' -Category 'Security' -Severity 'Info' `
+                -Evidence @("Defender AMRunningMode: $($status.AMRunningMode) - Defender is not the primary scanner (another AV product is); exclusion gaps are not evaluated.")
+        }
+    }
     $devRoots = @($script:DevRootCandidates | Where-Object { Test-Path $_ })
+    # Get-MpPreference returns $null (not an empty array) when no exclusions
+    # are configured; @($null).Count is 1, so filter out empty/null entries
+    # before counting or handing the lists to the gap analysis.
+    $exclusionPaths = @($prefs.ExclusionPath | Where-Object { $_ })
+    $exclusionProcesses = @($prefs.ExclusionProcess | Where-Object { $_ })
     $gaps = Get-DefenderExclusionGaps `
-        -ExclusionPaths @($prefs.ExclusionPath) `
-        -ExclusionProcesses @($prefs.ExclusionProcess) `
+        -ExclusionPaths $exclusionPaths `
+        -ExclusionProcesses $exclusionProcesses `
         -DevRoots $devRoots `
         -ToolchainProcesses $script:ToolchainProcesses
+    $rootsText = if (@($gaps.UncoveredRoots).Count -gt 0) { $gaps.UncoveredRoots -join ', ' } else { '(none)' }
+    $procsText = if (@($gaps.UncoveredProcesses).Count -gt 0) { $gaps.UncoveredProcesses -join ', ' } else { '(none)' }
     $evidence = @(
         "Real-time protection: ON"
-        "Path exclusions configured: $(@($prefs.ExclusionPath).Count)"
-        "Process exclusions configured: $(@($prefs.ExclusionProcess).Count)"
-        "Dev directories present but NOT excluded: $($gaps.UncoveredRoots -join ', ')"
-        "Toolchain processes NOT excluded: $($gaps.UncoveredProcesses -join ', ')"
+        "Path exclusions configured: $($exclusionPaths.Count)"
+        "Process exclusions configured: $($exclusionProcesses.Count)"
+        "Dev directories present but NOT excluded: $rootsText"
+        "Toolchain processes NOT excluded: $procsText"
     )
+    if ($exclusionPaths.Count -eq 0 -and $exclusionProcesses.Count -eq 0) {
+        $evidence += 'Note: exclusion lists can be hidden from local admins by policy (HideExclusionsFromLocalAdmins) - zero configured exclusions may not be real; confirm with IT.'
+    }
     if (@($gaps.UncoveredRoots).Count -gt 0 -or @($gaps.UncoveredProcesses).Count -gt 3) {
         New-DiagResult -Name 'Defender exclusion gaps' -Category 'Security' -Severity 'Problem' -Evidence $evidence `
             -Recommendation 'Ask IT to add Defender exclusions for the dev/build directories and toolchain processes listed above. Microsoft documents this for dev machines: https://learn.microsoft.com/en-us/defender-endpoint/configure-exclusions-microsoft-defender-antivirus'
@@ -432,7 +495,10 @@ function Get-DefenderResults {
 }
 
 function Get-SecurityAgentResults {
-    $services = @(Get-Service | Select-Object Name, DisplayName)
+    # EDR agents can lock down their own service objects; Get-Service throws
+    # access-denied on those. This is a read-only detection pass, so skip
+    # unreadable services rather than aborting the whole check.
+    $services = @(Get-Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName)
     $agents = @(Find-SecurityAgents -Services $services)
     if ($agents.Count -eq 0) {
         return New-DiagResult -Name 'Third-party security agents' -Category 'Security' -Severity 'OK' `
@@ -446,8 +512,7 @@ function Get-SecurityAgentResults {
 
 function Get-PowerResults {
     $planLine = (powercfg /getactivescheme) -join ' '
-    $planName = 'unknown'
-    if ($planLine -match '\((?<name>[^)]+)\)') { $planName = $Matches['name'] }
+    $planName = Resolve-PowerPlanName -SchemeLine $planLine
     $since = (Get-Date).AddDays(-7)
     $throttleEvents = @(Get-WinEvent -ErrorAction SilentlyContinue -FilterHashtable @{
         LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = $since
@@ -482,6 +547,9 @@ function Get-SearchIndexerResults {
 
 function Get-VbsResults {
     $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard
+    if (-not $dg) {
+        throw 'Win32_DeviceGuard returned no instances'
+    }
     $hvci = @($dg.SecurityServicesRunning) -contains 2
     if ($hvci) {
         New-DiagResult -Name 'Memory integrity (HVCI)' -Category 'OS' -Severity 'Info' `
@@ -497,8 +565,25 @@ function Get-MemoryResults {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem
     $top = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 |
         ForEach-Object { "Top consumer: $($_.ProcessName) $([math]::Round($_.WorkingSet64 / 1MB)) MB" })
-    Get-MemoryVerdict -TotalMB ($os.TotalVisibleMemorySize / 1KB) `
-        -FreeMB ($os.FreePhysicalMemory / 1KB) -TopConsumers $top
+    # Win32_OperatingSystem.FreePhysicalMemory excludes standby cache, so a
+    # healthy machine can look memory-starved. Prefer the locale-independent
+    # perf counter class (AvailableMBytes), which includes reclaimable
+    # standby cache; fall back to FreePhysicalMemory if that class/query fails.
+    $usedFallback = $false
+    try {
+        $perf = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+        if (-not $perf) { throw 'Win32_PerfFormattedData_PerfOS_Memory returned no instance' }
+        $freeMB = $perf.AvailableMBytes
+    } catch {
+        $freeMB = $os.FreePhysicalMemory / 1KB
+        $usedFallback = $true
+    }
+    $result = Get-MemoryVerdict -TotalMB ($os.TotalVisibleMemorySize / 1KB) `
+        -FreeMB $freeMB -TopConsumers $top
+    if ($usedFallback) {
+        $result.Evidence += 'Free-memory figure excludes standby cache and can understate available memory.'
+    }
+    $result
 }
 
 function Get-PendingRebootResults {
@@ -539,11 +624,15 @@ function Get-BenchmarkResults {
 function Invoke-Main {
     $hostName = [System.Environment]::MachineName
     Write-Host "Diagnose-DevMachine on $hostName - read-only diagnostic, ~2 minutes." -ForegroundColor Cyan
-    if (-not (Test-IsElevated)) {
-        Write-Host 'Not running elevated: Defender, BitLocker and event-log checks will be skipped.' -ForegroundColor Yellow
+    $elevated = Test-IsElevated
+    if (-not $elevated) {
+        Write-Host 'Not running elevated: BitLocker status will be unavailable and some Defender policy details may be hidden.' -ForegroundColor Yellow
     }
     $results = @()
+    $results += New-DiagResult -Name 'Elevation' -Category 'OS' -Severity 'Info' `
+        -Evidence @("Running elevated: $elevated")
     $results += Invoke-DiagCheck -Name 'Machine inventory' -Category 'Inventory' -Body { Get-InventoryResults }
+    $results += Invoke-DiagCheck -Name 'Storage' -Category 'Storage' -Body { Get-StorageResults }
     $results += Invoke-DiagCheck -Name 'Defender exclusions' -Category 'Security' -Body { Get-DefenderResults }
     $results += Invoke-DiagCheck -Name 'Third-party security agents' -Category 'Security' -Body { Get-SecurityAgentResults }
     $results += Invoke-DiagCheck -Name 'Power plan' -Category 'Power' -Body { Get-PowerResults }
@@ -560,7 +649,7 @@ function Invoke-Main {
     Write-Host ''
     Write-ConsoleSummary -Results $results
     $timestamp = Get-Date
-    $reportPath = Join-Path (Get-Location) "DevMachineDiag-$hostName-$($timestamp.ToString('yyyyMMdd-HHmm')).md"
+    $reportPath = Join-Path (Get-Location) "DevMachineDiag-$hostName-$($timestamp.ToString('yyyyMMdd-HHmmss')).md"
     Format-DiagReport -Results $results -ComputerName $hostName -Timestamp $timestamp |
         Set-Content -Path $reportPath -Encoding UTF8
     Write-Host ''
