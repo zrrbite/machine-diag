@@ -20,6 +20,11 @@ Describe 'Get-DefenderExclusionGaps' {
             -ExclusionProcesses @('C:\tools\bin\cl.exe') -DevRoots @() -ToolchainProcesses @('cl.exe')
         @($gaps.UncoveredProcesses).Count | Should -Be 0
     }
+    It 'handles forward-slash paths in process exclusions' {
+        $gaps = Get-DefenderExclusionGaps -ExclusionPaths @() `
+            -ExclusionProcesses @('C:/tools/bin/cl.exe') -DevRoots @() -ToolchainProcesses @('cl.exe')
+        @($gaps.UncoveredProcesses).Count | Should -Be 0
+    }
     It 'handles empty exclusion lists' {
         $gaps = Get-DefenderExclusionGaps -ExclusionPaths @() -ExclusionProcesses @() `
             -DevRoots @('C:\src') -ToolchainProcesses @('make.exe')

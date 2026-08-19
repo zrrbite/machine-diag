@@ -134,7 +134,8 @@ function Get-DefenderExclusionGaps {
         if (-not $covered) { $uncoveredRoots += $root }
     }
     $excludedNames = @($ExclusionProcesses | ForEach-Object {
-        ($_ -split '\\')[-1].ToLowerInvariant()
+        # Use split instead of [System.IO.Path]::GetFileName: .NET off-Windows doesn't treat backslash as a path separator, breaking cross-platform tests.
+        ($_ -split '[\\/]')[-1].ToLowerInvariant()
     })
     $uncoveredProcs = @($ToolchainProcesses | Where-Object {
         $excludedNames -notcontains $_.ToLowerInvariant()
