@@ -101,6 +101,87 @@ function Write-ConsoleSummary {
     }
 }
 
+# ---------- Security evaluators (pure logic; unit-tested) ----------
+
+$script:ToolchainProcesses = @(
+    'cl.exe','link.exe','lib.exe','msbuild.exe','devenv.exe','cmake.exe','ninja.exe',
+    'make.exe','gcc.exe','g++.exe','ld.exe','arm-none-eabi-gcc.exe','arm-none-eabi-g++.exe',
+    'armclang.exe','iccarm.exe','iarbuild.exe','git.exe','node.exe','python.exe','Code.exe'
+)
+
+$script:DevRootCandidates = @(
+    'C:\dev','C:\src','C:\work','C:\projects','C:\repos','C:\git',
+    "$env:USERPROFILE\dev","$env:USERPROFILE\src","$env:USERPROFILE\source",
+    "$env:USERPROFILE\work","$env:USERPROFILE\git","$env:USERPROFILE\repos",
+    "$env:USERPROFILE\Projects","$env:USERPROFILE\Development",
+    "$env:USERPROFILE\Documents\GitHub","$env:USERPROFILE\source\repos"
+)
+
+function Get-DefenderExclusionGaps {
+    param(
+        [string[]]$ExclusionPaths = @(),
+        [string[]]$ExclusionProcesses = @(),
+        [string[]]$DevRoots = @(),
+        [string[]]$ToolchainProcesses = @()
+    )
+    $uncoveredRoots = @()
+    foreach ($root in $DevRoots) {
+        $covered = $false
+        foreach ($ex in $ExclusionPaths) {
+            $exNorm = $ex.TrimEnd('\')
+            if ($root -eq $exNorm -or $root -like "$exNorm\*") { $covered = $true; break }
+        }
+        if (-not $covered) { $uncoveredRoots += $root }
+    }
+    $excludedNames = @($ExclusionProcesses | ForEach-Object {
+        ($_ -split '\\')[-1].ToLowerInvariant()
+    })
+    $uncoveredProcs = @($ToolchainProcesses | Where-Object {
+        $excludedNames -notcontains $_.ToLowerInvariant()
+    })
+    [pscustomobject]@{
+        UncoveredRoots     = $uncoveredRoots
+        UncoveredProcesses = $uncoveredProcs
+    }
+}
+
+$script:AgentCatalog = @(
+    @{ Pattern = 'CrowdStrike|CSFalcon';            Product = 'CrowdStrike Falcon' }
+    @{ Pattern = 'SentinelOne|Sentinel(Agent|Helper)'; Product = 'SentinelOne' }
+    @{ Pattern = 'Cortex XDR|Cyvera|Traps';         Product = 'Palo Alto Cortex XDR' }
+    @{ Pattern = 'Carbon ?Black|CbDefense';         Product = 'Carbon Black' }
+    @{ Pattern = 'Netskope|stAgentSvc';             Product = 'Netskope Client' }
+    @{ Pattern = 'Zscaler|ZSAService';              Product = 'Zscaler' }
+    @{ Pattern = 'Tanium';                          Product = 'Tanium' }
+    @{ Pattern = 'Qualys';                          Product = 'Qualys Cloud Agent' }
+    @{ Pattern = 'McAfee|Trellix|masvc';            Product = 'McAfee/Trellix' }
+    @{ Pattern = 'Symantec|SepMasterService';       Product = 'Symantec Endpoint Protection' }
+    @{ Pattern = 'Trend ?Micro|ds_agent|tmlisten';  Product = 'Trend Micro' }
+    @{ Pattern = 'Sophos';                          Product = 'Sophos' }
+    @{ Pattern = 'ESET|ekrn';                       Product = 'ESET' }
+    @{ Pattern = 'FortiClient|FortiEDR';            Product = 'Fortinet' }
+    @{ Pattern = 'Cybereason';                      Product = 'Cybereason' }
+    @{ Pattern = 'Elastic ?Agent';                  Product = 'Elastic Agent' }
+    @{ Pattern = 'Ivanti';                          Product = 'Ivanti' }
+)
+
+function Find-SecurityAgents {
+    param([object[]]$Services = @())
+    $found = @{}
+    foreach ($svc in $Services) {
+        foreach ($entry in $script:AgentCatalog) {
+            if ($svc.Name -match $entry.Pattern -or $svc.DisplayName -match $entry.Pattern) {
+                if (-not $found.ContainsKey($entry.Product)) { $found[$entry.Product] = @() }
+                $found[$entry.Product] += $svc.Name
+                break
+            }
+        }
+    }
+    foreach ($product in ($found.Keys | Sort-Object)) {
+        [pscustomobject]@{ Product = $product; Services = $found[$product] }
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
