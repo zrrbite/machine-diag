@@ -183,6 +183,120 @@ function Find-SecurityAgents {
     }
 }
 
+# ---------- System evaluators (pure logic; unit-tested) ----------
+
+function Get-PowerPlanVerdict {
+    param([string]$PlanName = 'unknown', [int]$ThrottleEventCount = 0)
+    $results = @()
+    if ($PlanName -match 'Power saver') {
+        $results += New-DiagResult -Name 'Power plan' -Category 'Power' -Severity 'Problem' `
+            -Evidence @("Active plan: $PlanName") `
+            -Recommendation 'Switch to the High performance (or at least Balanced) power plan.'
+    } elseif ($PlanName -match 'High performance|Ultimate') {
+        $results += New-DiagResult -Name 'Power plan' -Category 'Power' -Severity 'OK' `
+            -Evidence @("Active plan: $PlanName")
+    } else {
+        $results += New-DiagResult -Name 'Power plan' -Category 'Power' -Severity 'Info' `
+            -Evidence @("Active plan: $PlanName") `
+            -Recommendation 'Consider the High performance plan for build machines.'
+    }
+    if ($ThrottleEventCount -gt 0) {
+        $results += New-DiagResult -Name 'CPU throttling events' -Category 'Power' -Severity 'Warning' `
+            -Evidence @("$ThrottleEventCount Kernel-Processor-Power throttle events in the System log (last 7 days)") `
+            -Recommendation 'CPU is being thermally or firmware throttled. Check cooling, dock/PSU wattage, and BIOS power settings.'
+    }
+    $results
+}
+
+function Get-PendingRebootVerdict {
+    param([string[]]$Indicators = @())
+    if (@($Indicators).Count -eq 0) {
+        New-DiagResult -Name 'Pending reboot' -Category 'OS' -Severity 'OK' `
+            -Evidence @('No pending-reboot indicators found')
+    } else {
+        New-DiagResult -Name 'Pending reboot' -Category 'OS' -Severity 'Warning' `
+            -Evidence $Indicators `
+            -Recommendation 'Reboot the machine; a half-applied update can degrade performance.'
+    }
+}
+
+function Get-MemoryVerdict {
+    param(
+        [Parameter(Mandatory)][double]$TotalMB,
+        [Parameter(Mandatory)][double]$FreeMB,
+        [string[]]$TopConsumers = @()
+    )
+    $freePct = [math]::Round(100.0 * $FreeMB / $TotalMB, 1)
+    $evidence = @("$([math]::Round($TotalMB/1024,1)) GB total, $([math]::Round($FreeMB/1024,1)) GB free ($freePct`%)")
+    $evidence += $TopConsumers
+    if ($freePct -lt 10) {
+        New-DiagResult -Name 'Memory pressure' -Category 'Memory' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Machine is memory-starved; more RAM or fewer resident agents/apps needed.'
+    } elseif ($freePct -lt 20) {
+        New-DiagResult -Name 'Memory pressure' -Category 'Memory' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Memory is tight under load; consider a RAM upgrade for build machines.'
+    } else {
+        New-DiagResult -Name 'Memory pressure' -Category 'Memory' -Severity 'OK' -Evidence $evidence
+    }
+}
+
+function Get-DiskSpaceVerdict {
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][double]$FreeGB,
+        [Parameter(Mandatory)][double]$TotalGB
+    )
+    $freePct = [math]::Round(100.0 * $FreeGB / $TotalGB, 1)
+    $evidence = @("$DriveLetter`: $([math]::Round($FreeGB,1)) GB free of $([math]::Round($TotalGB,1)) GB ($freePct`%)")
+    if ($FreeGB -lt 10) {
+        New-DiagResult -Name "Disk space ($DriveLetter`:)" -Category 'Storage' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Under 10 GB free; SSD performance and Windows both degrade. Free up space.'
+    } elseif ($freePct -lt 15) {
+        New-DiagResult -Name "Disk space ($DriveLetter`:)" -Category 'Storage' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Low free space can slow SSD writes; free up space.'
+    } else {
+        New-DiagResult -Name "Disk space ($DriveLetter`:)" -Category 'Storage' -Severity 'OK' -Evidence $evidence
+    }
+}
+
+# ---------- Benchmark verdicts (heuristic thresholds; unit-tested) ----------
+
+function Get-FileBenchVerdict {
+    param([Parameter(Mandatory)]$Bench)
+    $perFileWriteMs = [math]::Round($Bench.WriteMs / [double]$Bench.FileCount, 2)
+    $evidence = @(
+        "Wrote $($Bench.FileCount) small files in $($Bench.WriteMs) ms ($perFileWriteMs ms/file)"
+        "Read back in $($Bench.ReadMs) ms; deleted in $($Bench.DeleteMs) ms"
+        'Heuristic reference: healthy SSD < 2 ms/file write; heavy AV/EDR scanning commonly shows 5-30 ms/file'
+    )
+    if ($perFileWriteMs -gt 8) {
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Small-file writes are far below healthy SSD rates - the signature of per-file security scanning. Request AV/EDR exclusions for build directories and toolchain processes.'
+    } elseif ($perFileWriteMs -gt 2) {
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Small-file writes are slower than a healthy SSD; likely scanning overhead. Compare against the Defender/agent findings above.'
+    } else {
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+    }
+}
+
+function Get-SpawnBenchVerdict {
+    param([Parameter(Mandatory)]$Bench)
+    $evidence = @(
+        "Spawned $($Bench.SpawnCount) short-lived processes in $($Bench.TotalMs) ms ($($Bench.PerSpawnMs) ms/spawn)"
+        'Heuristic reference: healthy < 30 ms/spawn; EDR process-hooking overhead commonly shows 100-300 ms/spawn'
+    )
+    if ($Bench.PerSpawnMs -gt 100) {
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Process creation is heavily taxed - typical of EDR hooking every process. Builds spawn thousands of compiler processes; request toolchain process exclusions.'
+    } elseif ($Bench.PerSpawnMs -gt 30) {
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Process creation is slower than expected; likely agent overhead.'
+    } else {
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
