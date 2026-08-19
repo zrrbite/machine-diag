@@ -368,10 +368,204 @@ function Invoke-ProcessSpawnBenchmark {
     }
 }
 
+# ---------- Windows collectors (thin cmdlet wrappers; validated on Windows) ----------
+
+function Test-IsElevated {
+    if (-not $script:OnWindows) { return $false }
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object System.Security.Principal.WindowsPrincipal $id).IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-InventoryResults {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+    $uptimeDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+    $evidence = @(
+        "OS: $($os.Caption) build $($os.BuildNumber)"
+        "CPU: $($cpu.Name) ($($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads)"
+        "RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GB"
+        "Uptime: $uptimeDays days"
+    )
+    foreach ($disk in (Get-PhysicalDisk)) {
+        $evidence += "Disk: $($disk.FriendlyName) - $($disk.MediaType), $([math]::Round($disk.Size / 1GB)) GB"
+    }
+    $results = @(New-DiagResult -Name 'Machine inventory' -Category 'Inventory' -Severity 'Info' -Evidence $evidence)
+    if ($uptimeDays -gt 30) {
+        $results += New-DiagResult -Name 'Long uptime' -Category 'OS' -Severity 'Warning' `
+            -Evidence @("Machine has not rebooted for $uptimeDays days") `
+            -Recommendation 'Reboot; long uptimes accumulate leaked resources and stalled updates.'
+    }
+    foreach ($vol in (Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' })) {
+        $results += Get-DiskSpaceVerdict -DriveLetter $vol.DriveLetter `
+            -FreeGB ($vol.SizeRemaining / 1GB) -TotalGB ($vol.Size / 1GB)
+    }
+    $results
+}
+
+function Get-DefenderResults {
+    $status = Get-MpComputerStatus
+    $prefs = Get-MpPreference
+    if (-not $status.RealTimeProtectionEnabled) {
+        return New-DiagResult -Name 'Defender real-time protection' -Category 'Security' -Severity 'Info' `
+            -Evidence @('Real-time protection is disabled (another AV product is likely primary)')
+    }
+    $devRoots = @($script:DevRootCandidates | Where-Object { Test-Path $_ })
+    $gaps = Get-DefenderExclusionGaps `
+        -ExclusionPaths @($prefs.ExclusionPath) `
+        -ExclusionProcesses @($prefs.ExclusionProcess) `
+        -DevRoots $devRoots `
+        -ToolchainProcesses $script:ToolchainProcesses
+    $evidence = @(
+        "Real-time protection: ON"
+        "Path exclusions configured: $(@($prefs.ExclusionPath).Count)"
+        "Process exclusions configured: $(@($prefs.ExclusionProcess).Count)"
+        "Dev directories present but NOT excluded: $($gaps.UncoveredRoots -join ', ')"
+        "Toolchain processes NOT excluded: $($gaps.UncoveredProcesses -join ', ')"
+    )
+    if (@($gaps.UncoveredRoots).Count -gt 0 -or @($gaps.UncoveredProcesses).Count -gt 3) {
+        New-DiagResult -Name 'Defender exclusion gaps' -Category 'Security' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Ask IT to add Defender exclusions for the dev/build directories and toolchain processes listed above. Microsoft documents this for dev machines: https://learn.microsoft.com/en-us/defender-endpoint/configure-exclusions-microsoft-defender-antivirus'
+    } else {
+        New-DiagResult -Name 'Defender exclusions' -Category 'Security' -Severity 'OK' -Evidence $evidence
+    }
+}
+
+function Get-SecurityAgentResults {
+    $services = @(Get-Service | Select-Object Name, DisplayName)
+    $agents = @(Find-SecurityAgents -Services $services)
+    if ($agents.Count -eq 0) {
+        return New-DiagResult -Name 'Third-party security agents' -Category 'Security' -Severity 'OK' `
+            -Evidence @('No known third-party security/management agents detected')
+    }
+    $evidence = @($agents | ForEach-Object { "$($_.Product) (services: $($_.Services -join ', '))" })
+    New-DiagResult -Name 'Third-party security agents' -Category 'Security' -Severity 'Warning' `
+        -Evidence $evidence `
+        -Recommendation 'Each agent adds per-file and per-process overhead. If benchmarks below are slow, these agents plus missing exclusions are the prime suspects - ask IT which of them scan build directories.'
+}
+
+function Get-PowerResults {
+    $planLine = (powercfg /getactivescheme) -join ' '
+    $planName = 'unknown'
+    if ($planLine -match '\((?<name>[^)]+)\)') { $planName = $Matches['name'] }
+    $since = (Get-Date).AddDays(-7)
+    $throttleEvents = @(Get-WinEvent -ErrorAction SilentlyContinue -FilterHashtable @{
+        LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = $since
+    })
+    Get-PowerPlanVerdict -PlanName $planName -ThrottleEventCount $throttleEvents.Count
+}
+
+function Get-BitLockerResults {
+    $volumes = @(Get-BitLockerVolume | Where-Object { $_.VolumeStatus -ne 'FullyDecrypted' })
+    if ($volumes.Count -eq 0) {
+        return New-DiagResult -Name 'BitLocker' -Category 'Storage' -Severity 'OK' `
+            -Evidence @('No encrypted volumes (or BitLocker not in use)')
+    }
+    $evidence = @($volumes | ForEach-Object {
+        "$($_.MountPoint) $($_.VolumeStatus), $($_.EncryptionPercentage)% encrypted, method $($_.EncryptionMethod)"
+    })
+    $inProgress = @($volumes | Where-Object { $_.VolumeStatus -eq 'EncryptionInProgress' })
+    if ($inProgress.Count -gt 0) {
+        New-DiagResult -Name 'BitLocker' -Category 'Storage' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Encryption is still in progress and competes for disk bandwidth; expect slowness until it completes.'
+    } else {
+        New-DiagResult -Name 'BitLocker' -Category 'Storage' -Severity 'Info' -Evidence $evidence
+    }
+}
+
+function Get-SearchIndexerResults {
+    $svc = Get-Service -Name WSearch
+    New-DiagResult -Name 'Windows Search indexer' -Category 'OS' -Severity 'Info' `
+        -Evidence @("WSearch service: $($svc.Status)") `
+        -Recommendation 'If source trees are indexed, exclude them (Indexing Options) - the indexer re-scans every build output.'
+}
+
+function Get-VbsResults {
+    $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard
+    $hvci = @($dg.SecurityServicesRunning) -contains 2
+    if ($hvci) {
+        New-DiagResult -Name 'Memory integrity (HVCI)' -Category 'OS' -Severity 'Info' `
+            -Evidence @('Virtualization-based security with memory integrity is running') `
+            -Recommendation 'HVCI costs a few percent on syscall/process-heavy workloads. Worth knowing, rarely the main culprit.'
+    } else {
+        New-DiagResult -Name 'Memory integrity (HVCI)' -Category 'OS' -Severity 'OK' `
+            -Evidence @('HVCI not running')
+    }
+}
+
+function Get-MemoryResults {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $top = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 |
+        ForEach-Object { "Top consumer: $($_.ProcessName) $([math]::Round($_.WorkingSet64 / 1MB)) MB" })
+    Get-MemoryVerdict -TotalMB ($os.TotalVisibleMemorySize / 1KB) `
+        -FreeMB ($os.FreePhysicalMemory / 1KB) -TopConsumers $top
+}
+
+function Get-PendingRebootResults {
+    $indicators = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $indicators += 'Component Based Servicing: RebootPending'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $indicators += 'Windows Update: RebootRequired'
+    }
+    $sm = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue
+    if ($sm -and ($sm.PSObject.Properties.Name -contains 'PendingFileRenameOperations')) {
+        $indicators += 'Session Manager: PendingFileRenameOperations'
+    }
+    Get-PendingRebootVerdict -Indicators $indicators
+}
+
+function Get-BenchmarkResults {
+    $benchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-bench-$PID"
+    New-Item -ItemType Directory -Path $benchRoot -Force | Out-Null
+    try {
+        $fileBench = Invoke-SmallFileBenchmark -WorkDir $benchRoot -FileCount $BenchFileCount
+        $results = @(Get-FileBenchVerdict -Bench $fileBench)
+        if ($script:OnWindows) {
+            $spawnBench = Invoke-ProcessSpawnBenchmark -SpawnCount $BenchSpawnCount
+        } else {
+            $spawnBench = Invoke-ProcessSpawnBenchmark -SpawnCount $BenchSpawnCount -Command '/bin/sh' -Arguments '-c "exit 0"'
+        }
+        $results += Get-SpawnBenchVerdict -Bench $spawnBench
+        $results
+    } finally {
+        Remove-Item -Path $benchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
-    Write-Host 'Diagnose-DevMachine: collectors not implemented yet.' -ForegroundColor Yellow
+    $hostName = [System.Environment]::MachineName
+    Write-Host "Diagnose-DevMachine on $hostName - read-only diagnostic, ~2 minutes." -ForegroundColor Cyan
+    if (-not (Test-IsElevated)) {
+        Write-Host 'Not running elevated: Defender, BitLocker and event-log checks will be skipped.' -ForegroundColor Yellow
+    }
+    $results = @()
+    $results += Invoke-DiagCheck -Name 'Machine inventory' -Category 'Inventory' -Body { Get-InventoryResults }
+    $results += Invoke-DiagCheck -Name 'Defender exclusions' -Category 'Security' -Body { Get-DefenderResults }
+    $results += Invoke-DiagCheck -Name 'Third-party security agents' -Category 'Security' -Body { Get-SecurityAgentResults }
+    $results += Invoke-DiagCheck -Name 'Power plan' -Category 'Power' -Body { Get-PowerResults }
+    $results += Invoke-DiagCheck -Name 'BitLocker' -Category 'Storage' -Body { Get-BitLockerResults }
+    $results += Invoke-DiagCheck -Name 'Windows Search indexer' -Category 'OS' -Body { Get-SearchIndexerResults }
+    $results += Invoke-DiagCheck -Name 'Memory integrity (HVCI)' -Category 'OS' -Body { Get-VbsResults }
+    $results += Invoke-DiagCheck -Name 'Memory pressure' -Category 'Memory' -Body { Get-MemoryResults }
+    $results += Invoke-DiagCheck -Name 'Pending reboot' -Category 'OS' -Body { Get-PendingRebootResults }
+    Write-Host 'Running benchmarks (moderate disk/CPU load for a minute or two)...' -ForegroundColor Cyan
+    $results += Invoke-DiagCheck -Name 'Benchmarks' -Category 'Benchmark' -Body { Get-BenchmarkResults }
+    if ($DefenderTrace) {
+        $results += Invoke-DiagCheck -Name 'Defender performance trace' -Category 'Security' -Body { Get-DefenderTraceResults }
+    }
+    Write-Host ''
+    Write-ConsoleSummary -Results $results
+    $timestamp = Get-Date
+    $reportPath = Join-Path (Get-Location) "DevMachineDiag-$hostName-$($timestamp.ToString('yyyyMMdd-HHmm')).md"
+    Format-DiagReport -Results $results -ComputerName $hostName -Timestamp $timestamp |
+        Set-Content -Path $reportPath -Encoding UTF8
+    Write-Host ''
+    Write-Host "Report written to $reportPath - share it with IT." -ForegroundColor Cyan
+    exit 0
 }
 
 if (-not $LibraryMode) { Invoke-Main }
