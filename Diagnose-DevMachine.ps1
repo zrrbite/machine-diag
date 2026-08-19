@@ -297,6 +297,72 @@ function Get-SpawnBenchVerdict {
     }
 }
 
+# ---------- Benchmark engines (cross-platform; integration-tested) ----------
+
+function Invoke-SmallFileBenchmark {
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [int]$FileCount = 2000,
+        [int]$FileSizeBytes = 4096,
+        [int]$DirFanout = 50
+    )
+    $extensions = @('.c', '.h', '.o', '.obj', '.d')
+    $payload = New-Object byte[] $FileSizeBytes
+    (New-Object System.Random 42).NextBytes($payload)
+    for ($d = 0; $d -lt $DirFanout; $d++) {
+        $sub = Join-Path $WorkDir ('d{0:D3}' -f $d)
+        if (-not (Test-Path $sub)) { New-Item -ItemType Directory -Path $sub | Out-Null }
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $FileCount; $i++) {
+        $sub = Join-Path $WorkDir ('d{0:D3}' -f ($i % $DirFanout))
+        $ext = $extensions[$i % $extensions.Count]
+        [System.IO.File]::WriteAllBytes((Join-Path $sub "f$i$ext"), $payload)
+    }
+    $writeMs = $sw.ElapsedMilliseconds
+    $sw.Restart()
+    foreach ($f in (Get-ChildItem -Path $WorkDir -Recurse -File)) {
+        [void][System.IO.File]::ReadAllBytes($f.FullName)
+    }
+    $readMs = $sw.ElapsedMilliseconds
+    $sw.Restart()
+    for ($d = 0; $d -lt $DirFanout; $d++) {
+        Remove-Item -Path (Join-Path $WorkDir ('d{0:D3}' -f $d)) -Recurse -Force
+    }
+    $deleteMs = $sw.ElapsedMilliseconds
+    [pscustomobject]@{
+        FileCount = $FileCount
+        WriteMs   = $writeMs
+        ReadMs    = $readMs
+        DeleteMs  = $deleteMs
+    }
+}
+
+function Invoke-ProcessSpawnBenchmark {
+    param(
+        [int]$SpawnCount = 100,
+        [string]$Command = 'cmd.exe',
+        [string]$Arguments = '/c exit'
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $SpawnCount; $i++) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Command
+        $psi.Arguments = $Arguments
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.WaitForExit()
+        $p.Dispose()
+    }
+    $totalMs = $sw.ElapsedMilliseconds
+    [pscustomobject]@{
+        SpawnCount = $SpawnCount
+        TotalMs    = $totalMs
+        PerSpawnMs = [math]::Round($totalMs / [double]$SpawnCount, 1)
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
