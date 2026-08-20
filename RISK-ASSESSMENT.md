@@ -26,9 +26,11 @@ fixes; it applies none.
   a built-in catalog of known security/management products, plus a direct
   status check of the Windows Search indexer service (`WSearch`).
 - Active power scheme (`powercfg /getactivescheme`), resolved by GUID
-  against a table of well-known plan GUIDs so the result is correct
-  regardless of the OS display language/locale, and Kernel-Processor-Power
-  throttle events (Id 37, last 7 days) from the System event log.
+  against a table of well-known plan GUIDs for the four built-in Windows
+  plans; custom or OEM plans fall back to the localized display name. This
+  ensures correct identification regardless of OS display language/locale for
+  standard plans. Also Kernel-Processor-Power throttle events (Id 37, last 7
+  days) from the System event log.
 - BitLocker volume status (`Get-BitLockerVolume`).
 - CIM classes: `Win32_OperatingSystem`, `Win32_Processor`,
   `Win32_DeviceGuard` (HVCI/memory-integrity status), and
@@ -74,13 +76,11 @@ setting) and `Set-Content` (writing the report file), and the only
 
 ## Why elevation is requested
 
-`Get-BitLockerVolume` and some `Get-MpPreference` policy detail require
-administrator rights. The script runs without elevation too: it prints a
-warning that BitLocker status will be unavailable and some Defender
-policy details may be hidden, and every report includes an "Elevation"
-entry stating whether the run was elevated. A failed BitLocker check is
-recorded as "Skipped" with the reason; the rest of the checks and both
-benchmarks still run.
+`Get-BitLockerVolume` requires administrator rights. The script runs without
+elevation too: it prints a warning that BitLocker status will be unavailable,
+and every report includes an "Elevation" entry stating whether the run was
+elevated. A failed BitLocker check is recorded as "Skipped" with the reason;
+the rest of the checks and both benchmarks still run.
 
 ## Resource impact
 
@@ -94,8 +94,9 @@ background.
 ## Data sensitivity of the report
 
 The report contains the hostname, hardware summary, service names,
-Defender exclusion paths, and development directory paths - paths may
-embed usernames. It contains no file contents, no credentials. Treat it
+counts of configured Defender exclusions, and the names of common development
+directories found on the machine that are not covered by an exclusion - paths
+may embed usernames. It contains no file contents, no credentials. Treat it
 as internal; share only with IT.
 
 ## Failure behavior

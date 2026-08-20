@@ -11,8 +11,8 @@ Open an elevated PowerShell (right-click - Run as administrator), then:
 Takes about two minutes; moderate disk/CPU load while the benchmarks run.
 The result is `DevMachineDiag-<machine>-<timestamp>.md` next to the script
 (timestamp down to the second, e.g. `DevMachineDiag-BUILD01-20260819-153045.md`)
-- findings ranked by severity with the evidence and a recommended fix for
-each. Treat the report as internal (it contains machine name and paths)
+- findings ranked by severity with the evidence and a recommended fix where
+one applies. Treat the report as internal (it contains machine name and paths)
 and share it with IT.
 
 You don't have to run it elevated - it still works. Without elevation,
