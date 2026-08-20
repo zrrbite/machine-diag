@@ -37,6 +37,24 @@ Describe 'Get-PowerPlanVerdict' {
     }
 }
 
+Describe 'Get-ProcessorStateVerdict' {
+    It 'flags a cap below 70% as Problem' {
+        $r = Get-ProcessorStateVerdict -MaxAcPct 50 -MinAcPct 5
+        $r.Severity | Should -Be 'Problem'
+        $r.Evidence | Should -Contain 'Max processor state (AC): 50%'
+        $r.Evidence | Should -Contain 'Min processor state (AC): 5%'
+        $r.Recommendation | Should -Match '50%'
+    }
+    It 'flags a cap below 100% (but at least 70%) as Warning' {
+        $r = Get-ProcessorStateVerdict -MaxAcPct 80 -MinAcPct 5
+        $r.Severity | Should -Be 'Warning'
+    }
+    It 'is OK at 100%' {
+        $r = Get-ProcessorStateVerdict -MaxAcPct 100 -MinAcPct 100
+        $r.Severity | Should -Be 'OK'
+    }
+}
+
 Describe 'Get-PendingRebootVerdict' {
     It 'is OK with no indicators' {
         (Get-PendingRebootVerdict -Indicators @()).Severity | Should -Be 'OK'

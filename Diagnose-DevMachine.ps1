@@ -12,8 +12,8 @@
 param(
     [switch]$DefenderTrace,
     [switch]$LibraryMode,
-    [int]$BenchFileCount = 2000,
-    [int]$BenchSpawnCount = 100
+    [ValidateRange(1, 100000)][int]$BenchFileCount = 2000,
+    [ValidateRange(1, 10000)][int]$BenchSpawnCount = 100
 )
 
 Set-StrictMode -Version 2.0
@@ -233,6 +233,26 @@ function Get-PowerPlanVerdict {
             -Recommendation 'CPU is being thermally or firmware throttled. Check cooling, dock/PSU wattage, and BIOS power settings.'
     }
     $results
+}
+
+function Get-ProcessorStateVerdict {
+    param(
+        [Parameter(Mandatory)][int]$MaxAcPct,
+        [Parameter(Mandatory)][int]$MinAcPct
+    )
+    $evidence = @(
+        "Max processor state (AC): $MaxAcPct`%"
+        "Min processor state (AC): $MinAcPct`%"
+    )
+    if ($MaxAcPct -lt 70) {
+        New-DiagResult -Name 'Processor power limits' -Category 'Power' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation "Processor capped at $MaxAcPct`% - builds run correspondingly slower; ask IT to lift the cap."
+    } elseif ($MaxAcPct -lt 100) {
+        New-DiagResult -Name 'Processor power limits' -Category 'Power' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation "Processor capped at $MaxAcPct`% - ask IT to lift the cap for full build performance."
+    } else {
+        New-DiagResult -Name 'Processor power limits' -Category 'Power' -Severity 'OK' -Evidence $evidence
+    }
 }
 
 function Get-PendingRebootVerdict {
@@ -469,6 +489,7 @@ function Get-DefenderResults {
     # before counting or handing the lists to the gap analysis.
     $exclusionPaths = @($prefs.ExclusionPath | Where-Object { $_ })
     $exclusionProcesses = @($prefs.ExclusionProcess | Where-Object { $_ })
+    $exclusionExtensions = @($prefs.ExclusionExtension | Where-Object { $_ })
     $gaps = Get-DefenderExclusionGaps `
         -ExclusionPaths $exclusionPaths `
         -ExclusionProcesses $exclusionProcesses `
@@ -480,6 +501,7 @@ function Get-DefenderResults {
         "Real-time protection: ON"
         "Path exclusions configured: $($exclusionPaths.Count)"
         "Process exclusions configured: $($exclusionProcesses.Count)"
+        "Extension exclusions configured: $($exclusionExtensions.Count)"
         "Dev directories present but NOT excluded: $rootsText"
         "Toolchain processes NOT excluded: $procsText"
     )
@@ -517,7 +539,29 @@ function Get-PowerResults {
     $throttleEvents = @(Get-WinEvent -ErrorAction SilentlyContinue -FilterHashtable @{
         LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = $since
     })
-    Get-PowerPlanVerdict -PlanName $planName -ThrottleEventCount $throttleEvents.Count
+    $results = @(Get-PowerPlanVerdict -PlanName $planName -ThrottleEventCount $throttleEvents.Count)
+    # An IT-forced max-processor-state cap below 100% is otherwise invisible
+    # to the user. `powercfg /q` label text is localized, so instead of
+    # matching a localized "AC" label we take the first line in each output
+    # that contains both 'AC' and '0x', then read the LAST hex value on that
+    # line (defends against extra hex-looking tokens earlier on the line).
+    # This sub-collection is isolated in its own try/catch: a parsing/locale
+    # failure here should not take down the rest of the power check - on
+    # failure we simply omit the processor-state result.
+    try {
+        $maxOutput = powercfg /q SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX
+        $minOutput = powercfg /q SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN
+        $maxAcLine = @($maxOutput | Where-Object { $_ -match 'AC' -and $_ -match '0x' })[0]
+        $minAcLine = @($minOutput | Where-Object { $_ -match 'AC' -and $_ -match '0x' })[0]
+        $maxHexMatches = [regex]::Matches($maxAcLine, '0x[0-9a-fA-F]+')
+        $minHexMatches = [regex]::Matches($minAcLine, '0x[0-9a-fA-F]+')
+        $maxAcPct = [Convert]::ToInt32($maxHexMatches[$maxHexMatches.Count - 1].Value, 16)
+        $minAcPct = [Convert]::ToInt32($minHexMatches[$minHexMatches.Count - 1].Value, 16)
+        $results += Get-ProcessorStateVerdict -MaxAcPct $maxAcPct -MinAcPct $minAcPct
+    } catch {
+        # Omit the processor-state result; the rest of the power check stands.
+    }
+    $results
 }
 
 function Get-BitLockerResults {
@@ -705,7 +749,11 @@ function Invoke-Main {
     Write-Host ''
     Write-ConsoleSummary -Results $results
     $timestamp = Get-Date
-    $reportPath = Join-Path (Get-Location) "DevMachineDiag-$hostName-$($timestamp.ToString('yyyyMMdd-HHmmss')).md"
+    # Write the report next to the script itself, not the current directory:
+    # an elevated shell often starts in C:\Windows\system32, and running the
+    # script by full path from there would otherwise drop the report there.
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $reportPath = Join-Path $scriptDir "DevMachineDiag-$hostName-$($timestamp.ToString('yyyyMMdd-HHmmss')).md"
     Format-DiagReport -Results $results -ComputerName $hostName -Timestamp $timestamp |
         Set-Content -Path $reportPath -Encoding UTF8
     Write-Host ''

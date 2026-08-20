@@ -2,7 +2,7 @@
 
 Audience: IT / security reviewers deciding whether developers may run
 this script elevated. The script is a single plaintext PowerShell file
-(716 lines, no obfuscation, no embedded binaries, nothing downloaded),
+(~760 lines, no obfuscation, no embedded binaries, nothing downloaded),
 so every claim below is verifiable by reading it.
 
 ## Purpose
@@ -50,8 +50,10 @@ fixes; it applies none.
    the payload) so Defender's scan-result caching can't skip repeat
    files and the benchmark reflects real per-file scan cost. Deleted in
    a `finally` block.
-2. The report file `DevMachineDiag-<host>-<yyyyMMdd-HHmmss>.md` in the
-   current directory.
+2. The report file `DevMachineDiag-<host>-<yyyyMMdd-HHmmss>.md` next to the
+   script itself (resolved via `Split-Path -Parent $PSCommandPath`), not the
+   current directory - this matters because an elevated shell commonly
+   starts in `C:\Windows\system32`.
 3. With `-DefenderTrace` only: a second temporary benchmark folder (the
    file benchmark re-run in a background job while Defender activity is
    recorded) and a Defender performance recording `.etl`, both under
