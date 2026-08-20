@@ -647,6 +647,7 @@ function Get-DefenderTraceResults {
     $etl = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-defender-$PID.etl"
     $benchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-trace-bench-$PID"
     New-Item -ItemType Directory -Path $benchRoot -Force | Out-Null
+    $job = $null
     try {
         Write-Host 'Recording Defender activity for 30 s while re-running the file benchmark...' -ForegroundColor Cyan
         $job = Start-Job -ScriptBlock {
@@ -656,7 +657,6 @@ function Get-DefenderTraceResults {
         } -ArgumentList $PSCommandPath, $benchRoot, $BenchFileCount
         New-MpPerformanceRecording -RecordTo $etl -Seconds 30
         Wait-Job $job -Timeout 60 | Out-Null
-        Remove-Job $job -Force
         $report = Get-MpPerformanceReport -Path $etl -TopFiles 5 -TopProcesses 5 -TopExtensions 5
         $evidence = Format-DefenderTraceEvidence `
             -TopFiles @($report.TopFiles) `
@@ -666,6 +666,10 @@ function Get-DefenderTraceResults {
             -Evidence $evidence `
             -Recommendation 'This is first-party Microsoft data on what Defender spent scan time on. If build files/toolchain dominate, it directly justifies the exclusion request.'
     } finally {
+        if ($job) {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+        }
         Remove-Item -Path $etl -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $benchRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
