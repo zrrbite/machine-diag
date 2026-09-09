@@ -24,5 +24,42 @@ spends scan time on):
 
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -DefenderTrace
 
-The tool is strictly read-only - it changes nothing on the machine.
-IT/security reviewers: see RISK-ASSESSMENT.md.
+## Measuring real compilation (`-CompileBench`)
+
+The default benchmarks measure compile-*shaped* work: small-file I/O and
+process spawning. That misses what actually dominates a build - headers read
+over and over, executable output, and the weight of a real compiler process.
+`-CompileBench` generates a small C++ project in `%TEMP%`, compiles it three
+times and links it:
+
+    powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -CompileBench
+
+Adds roughly 30-45 s of heavy CPU load. It uses a compiler the machine
+already has - `cl` (if you are in a VS developer prompt), else `clang-cl`,
+`clang++`, `clang` or `g++`, else Visual Studio located via `vswhere`. Point
+it at a specific one with `-CompileBenchCompiler <path>`. With no compiler
+available the check is simply reported as Skipped.
+
+The number to look at is **"Scan time attributable to the build"**, and
+getting it needs both flags plus an elevated shell:
+
+    powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -CompileBench -DefenderTrace
+
+That records what Defender actually spent scanning on behalf of the compiler
+and reports it as a share of compile wall time. Under 5% means scanning is
+not your bottleneck; above 20% means exclusions would pay for themselves.
+It is a direct measurement, which is exactly why it is worth the elevation -
+the timing-only numbers cannot separate scanning cost from ordinary compiler
+work, and an earlier version of this tool got that wrong. See the amendment
+in `docs/superpowers/specs/2026-09-09-compile-benchmark-design.md`.
+
+Without `-DefenderTrace` you still get compile throughput, parallel scaling
+and link time, which are enough to spot a badly misbehaving machine.
+
+## Safety
+
+The tool changes no machine state - it reads configuration, writes only its
+own `%TEMP%` scratch folders and the report, and makes no network
+connections. With `-CompileBench` it additionally runs an already-installed
+compiler over source it generated itself; the executable that produces is
+never run. IT/security reviewers: see RISK-ASSESSMENT.md.

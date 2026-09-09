@@ -5,15 +5,25 @@
     Read-only diagnostic: collects configuration evidence and runs compile-shaped
     micro-benchmarks, then writes a ranked Markdown report for IT.
     Changes NOTHING on the machine. See RISK-ASSESSMENT.md.
+
+    -CompileBench additionally builds a generated C++ project with a compiler the
+    machine already has, to measure real compilation rather than compile-shaped
+    I/O. The linked executable is never run.
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -CompileBench -DefenderTrace
 #>
 [CmdletBinding()]
 param(
     [switch]$DefenderTrace,
+    [switch]$CompileBench,
     [switch]$LibraryMode,
     [ValidateRange(1, 100000)][int]$BenchFileCount = 2000,
-    [ValidateRange(1, 10000)][int]$BenchSpawnCount = 100
+    [ValidateRange(1, 10000)][int]$BenchSpawnCount = 100,
+    [string]$CompileBenchCompiler = '',
+    [ValidateRange(1, 2000)][int]$CompileBenchTuCount = 30,
+    [ValidateRange(1, 200)][int]$CompileBenchHeaderCount = 8
 )
 
 Set-StrictMode -Version 2.0
@@ -23,7 +33,6 @@ $script:OnWindows = ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
 $script:SeverityOrder = @{ 'Problem' = 0; 'Warning' = 1; 'Info' = 2; 'OK' = 3; 'Skipped' = 4 }
 
 # ---------- Core framework ----------
-
 function New-DiagResult {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -757,6 +766,555 @@ function Get-BenchmarkResults {
     }
 }
 
+# ---------- Compile benchmark (optional, -CompileBench) ----------
+
+function Get-QuotedArg {
+    param([string]$Value)
+    '"' + $Value + '"'
+}
+
+function Import-MsvcEnvironment {
+    # Last-resort toolchain discovery: Visual Studio is installed but no compiler
+    # is on PATH (the usual state outside a developer prompt). Imports VsDevCmd's
+    # environment into THIS PowerShell process only - it is gone when the script
+    # exits and nothing is written to the machine or user environment.
+    $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if (-not $pf86) { return $null }
+    $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { return $null }
+    $installPath = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath 2>$null | Select-Object -First 1
+    if (-not $installPath) { return $null }
+    $devCmd = Join-Path $installPath 'Common7\Tools\VsDevCmd.bat'
+    if (-not (Test-Path $devCmd)) { return $null }
+    $dump = cmd /c "`"$devCmd`" -arch=x64 -no_logo && set" 2>$null
+    foreach ($line in $dump) {
+        if ($line -match '^([^=]+)=(.*)$') {
+            Set-Item -Path ('env:' + $Matches[1]) -Value $Matches[2] -ErrorAction SilentlyContinue
+        }
+    }
+    $cmd = Get-Command 'cl' -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    [pscustomobject]@{
+        Name       = 'cl'
+        Path       = $cmd.Source
+        Style      = 'MSVC'
+        DriverMode = ''
+        Source     = "MSVC via vswhere ($installPath)"
+    }
+}
+
+function Resolve-CompileToolchain {
+    param([string]$Override = '')
+
+    if ($Override) {
+        if (-not (Test-Path $Override)) {
+            throw "Compiler not found at -CompileBenchCompiler path: $Override"
+        }
+        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($Override)
+        $style = if (@('cl', 'clang-cl') -contains $leaf) { 'MSVC' } else { 'GNU' }
+        $driver = if ($leaf -eq 'clang') { '--driver-mode=g++' } else { '' }
+        return [pscustomobject]@{
+            Name = $leaf; Path = $Override; Style = $style
+            DriverMode = $driver; Source = 'explicit -CompileBenchCompiler'
+        }
+    }
+
+    # cl.exe first: if it is already on PATH the developer is in a VS prompt, so
+    # MSVC is what their real builds actually use.
+    $candidates = @(
+        [pscustomobject]@{ Name = 'cl';       Style = 'MSVC'; DriverMode = '';                  Source = 'MSVC on PATH (developer prompt)' }
+        [pscustomobject]@{ Name = 'clang-cl'; Style = 'MSVC'; DriverMode = '';                  Source = 'clang-cl on PATH' }
+        [pscustomobject]@{ Name = 'clang++';  Style = 'GNU';  DriverMode = '';                  Source = 'clang++ on PATH' }
+        [pscustomobject]@{ Name = 'clang';    Style = 'GNU';  DriverMode = '--driver-mode=g++'; Source = 'clang on PATH (g++ driver mode)' }
+        [pscustomobject]@{ Name = 'g++';      Style = 'GNU';  DriverMode = '';                  Source = 'g++ on PATH' }
+    )
+    foreach ($c in $candidates) {
+        $cmd = Get-Command $c.Name -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            return [pscustomobject]@{
+                Name = $c.Name; Path = $cmd.Source; Style = $c.Style
+                DriverMode = $c.DriverMode; Source = $c.Source
+            }
+        }
+    }
+
+    if ($script:OnWindows) {
+        $fromVs = Import-MsvcEnvironment
+        if ($fromVs) { return $fromVs }
+    }
+
+    $searched = ($candidates | ForEach-Object { $_.Name }) -join ', '
+    throw ("No C++ compiler found. Searched PATH for: $searched; then Visual Studio via vswhere. " +
+           'Use -CompileBenchCompiler <path> to name one explicitly.')
+}
+
+function New-CompileBenchProject {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [int]$TuCount = 30,
+        [int]$HeaderCount = 8
+    )
+    $srcDir = Join-Path $Root 'src'
+    $incDir = Join-Path $Root 'include'
+    New-Item -ItemType Directory -Path $srcDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $incDir -Force | Out-Null
+
+    # Headers pull in real standard-library content and instantiate templates, so
+    # the front-end does work proportional to a real TU rather than measuring
+    # process startup. Every TU includes every header - that repetition is the
+    # point, since it is what exercises scan-result caching.
+    for ($h = 0; $h -lt $HeaderCount; $h++) {
+        $headerText = @"
+#pragma once
+#include <vector>
+#include <string>
+#include <map>
+#include <algorithm>
+#include <memory>
+
+namespace bench$h {
+
+template <typename T, int N>
+struct Matrix {
+    T cells[N][N];
+    Matrix() {
+        for (int r = 0; r < N; ++r)
+            for (int c = 0; c < N; ++c)
+                cells[r][c] = static_cast<T>(r * N + c);
+    }
+    T trace() const {
+        T sum = T();
+        for (int i = 0; i < N; ++i) sum += cells[i][i];
+        return sum;
+    }
+};
+
+template <int N>
+struct Fib { static const int value = Fib<N - 1>::value + Fib<N - 2>::value; };
+template <> struct Fib<0> { static const int value = 0; };
+template <> struct Fib<1> { static const int value = 1; };
+
+inline int summarize(const std::vector<std::string>& names) {
+    std::map<std::string, int> counts;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        counts[names[i]] += static_cast<int>(names[i].size());
+    }
+    int total = 0;
+    for (std::map<std::string, int>::const_iterator it = counts.begin(); it != counts.end(); ++it) {
+        total += it->second;
+    }
+    return total;
+}
+
+inline int workload() {
+    Matrix<int, 8> m;
+    std::vector<std::string> names;
+    names.push_back("bench$h");
+    std::sort(names.begin(), names.end());
+    return m.trace() + Fib<18>::value + summarize(names);
+}
+
+}
+"@
+        Set-Content -Path (Join-Path $incDir "bench$h.h") -Value $headerText -Encoding UTF8
+    }
+
+    $includeLines = (0..($HeaderCount - 1) | ForEach-Object { "#include `"bench$_.h`"" }) -join "`n"
+    $calls = (0..($HeaderCount - 1) | ForEach-Object { "bench${_}::workload()" }) -join ' + '
+
+    $sources = @()
+    for ($t = 0; $t -lt $TuCount; $t++) {
+        $tuText = @"
+$includeLines
+
+int tu_${t}_entry() {
+    return $calls;
+}
+"@
+        $tuPath = Join-Path $srcDir "tu$t.cpp"
+        Set-Content -Path $tuPath -Value $tuText -Encoding UTF8
+        $sources += $tuPath
+    }
+
+    $externs = (0..($TuCount - 1) | ForEach-Object { "int tu_${_}_entry();" }) -join "`n"
+    $sum = (0..($TuCount - 1) | ForEach-Object { "tu_${_}_entry()" }) -join ' + '
+    $mainText = @"
+$externs
+
+int main() {
+    return ($sum) & 1;
+}
+"@
+    $mainPath = Join-Path $srcDir 'main.cpp'
+    Set-Content -Path $mainPath -Value $mainText -Encoding UTF8
+    $sources += $mainPath
+
+    [pscustomobject]@{
+        Root        = $Root
+        SourceDir   = $srcDir
+        IncludeDir  = $incDir
+        Sources     = $sources
+        MainSource  = $mainPath
+        TuCount     = $sources.Count
+        HeaderCount = $HeaderCount
+    }
+}
+
+function Get-CompileCommandLine {
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$ObjPath,
+        [Parameter(Mandatory)][string]$IncludeDir
+    )
+    if ($Toolchain.Style -eq 'MSVC') {
+        @('/c', '/nologo', '/EHsc', '/std:c++17',
+          ('/I' + (Get-QuotedArg $IncludeDir)),
+          ('/Fo' + (Get-QuotedArg $ObjPath)),
+          (Get-QuotedArg $Source)) -join ' '
+    } else {
+        $parts = @()
+        if ($Toolchain.DriverMode) { $parts += $Toolchain.DriverMode }
+        $parts += @('-c', '-std=c++17',
+                    ('-I' + (Get-QuotedArg $IncludeDir)),
+                    '-o', (Get-QuotedArg $ObjPath),
+                    (Get-QuotedArg $Source))
+        $parts -join ' '
+    }
+}
+
+function Get-LinkCommandLine {
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][string[]]$ObjPaths,
+        [Parameter(Mandatory)][string]$ExePath
+    )
+    $objs = ($ObjPaths | ForEach-Object { Get-QuotedArg $_ }) -join ' '
+    if ($Toolchain.Style -eq 'MSVC') {
+        @('/nologo', ('/Fe' + (Get-QuotedArg $ExePath)), $objs) -join ' '
+    } else {
+        $parts = @()
+        if ($Toolchain.DriverMode) { $parts += $Toolchain.DriverMode }
+        $parts += @('-o', (Get-QuotedArg $ExePath), $objs)
+        $parts -join ' '
+    }
+}
+
+function Start-CompileProcess {
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][string]$Arguments
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Toolchain.Path
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    # Redirected so compiler chatter does not pollute the console summary. Output
+    # is drained after exit; with /nologo a successful TU emits only its filename,
+    # far below the pipe buffer, so draining late cannot stall the child.
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    [System.Diagnostics.Process]::Start($psi)
+}
+
+function Test-CompileToolchain {
+    # Compile one TU before timing anything. A toolchain that cannot build the
+    # generated project (clang-cl with no MSVC headers, say) surfaces here as a
+    # Skipped check with the compiler's own error, not as a bogus timing.
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][object]$Project,
+        [Parameter(Mandatory)][string]$ObjDir
+    )
+    New-Item -ItemType Directory -Path $ObjDir -Force | Out-Null
+    $cmdline = Get-CompileCommandLine -Toolchain $Toolchain -Source $Project.Sources[0] `
+        -ObjPath (Join-Path $ObjDir 'preflight.obj') -IncludeDir $Project.IncludeDir
+    $proc = Start-CompileProcess -Toolchain $Toolchain -Arguments $cmdline
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    $code = $proc.ExitCode
+    $proc.Dispose()
+    if ($code -ne 0) {
+        $detail = ((($stderr + "`n" + $stdout).Trim() -split "`r?`n") |
+            Where-Object { $_ -ne '' } | Select-Object -First 3) -join '; '
+        throw "$($Toolchain.Name) could not compile the generated project (exit $code): $detail"
+    }
+}
+
+function Invoke-CompilePass {
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][object]$Project,
+        [Parameter(Mandatory)][string]$ObjDir,
+        [int]$JobCount = 1
+    )
+    New-Item -ItemType Directory -Path $ObjDir -Force | Out-Null
+    $queue = New-Object System.Collections.Queue
+    foreach ($s in $Project.Sources) { $queue.Enqueue($s) | Out-Null }
+    $running = New-Object System.Collections.ArrayList
+    $failed = 0
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+        while ($running.Count -lt $JobCount -and $queue.Count -gt 0) {
+            $src = $queue.Dequeue()
+            $obj = Join-Path $ObjDir ([System.IO.Path]::GetFileNameWithoutExtension($src) + '.obj')
+            $cmdline = Get-CompileCommandLine -Toolchain $Toolchain -Source $src -ObjPath $obj -IncludeDir $Project.IncludeDir
+            [void]$running.Add((Start-CompileProcess -Toolchain $Toolchain -Arguments $cmdline))
+        }
+        if ($running.Count -gt 0) {
+            $running[0].WaitForExit()
+            for ($i = $running.Count - 1; $i -ge 0; $i--) {
+                if ($running[$i].HasExited) {
+                    [void]$running[$i].StandardOutput.ReadToEnd()
+                    [void]$running[$i].StandardError.ReadToEnd()
+                    if ($running[$i].ExitCode -ne 0) { $failed++ }
+                    $running[$i].Dispose()
+                    $running.RemoveAt($i)
+                }
+            }
+        }
+    }
+    $sw.Stop()
+    if ($failed -gt 0) {
+        throw "$failed of $($Project.Sources.Count) compiles failed during the benchmark pass."
+    }
+    [pscustomobject]@{
+        ElapsedMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        ObjDir    = $ObjDir
+        JobCount  = $JobCount
+    }
+}
+
+function Invoke-LinkBenchmark {
+    param(
+        [Parameter(Mandatory)][object]$Toolchain,
+        [Parameter(Mandatory)][string]$ObjDir,
+        [Parameter(Mandatory)][string]$ExePath
+    )
+    $objs = @(Get-ChildItem -Path $ObjDir -Filter '*.obj' -File | ForEach-Object { $_.FullName })
+    if ($objs.Count -eq 0) { throw 'No object files were produced to link.' }
+    $cmdline = Get-LinkCommandLine -Toolchain $Toolchain -ObjPaths $objs -ExePath $ExePath
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $proc = Start-CompileProcess -Toolchain $Toolchain -Arguments $cmdline
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    $sw.Stop()
+    $code = $proc.ExitCode
+    $proc.Dispose()
+    if ($code -ne 0) {
+        $detail = ((($stderr + "`n" + $stdout).Trim() -split "`r?`n") |
+            Where-Object { $_ -ne '' } | Select-Object -First 3) -join '; '
+        throw "Link failed (exit $code): $detail"
+    }
+    # The executable is produced but never run - see RISK-ASSESSMENT.md.
+    [pscustomobject]@{
+        ElapsedMs   = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        ObjectCount = $objs.Count
+    }
+}
+
+function Invoke-CompileTraceWorkload {
+    # Compile workload for the -DefenderTrace recording, reconstructed from plain
+    # strings because it runs inside a background job.
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$CompilerPath,
+        [Parameter(Mandatory)][string]$Style,
+        [string]$DriverMode = '',
+        [int]$TuCount = 30,
+        [int]$HeaderCount = 8
+    )
+    $toolchain = [pscustomobject]@{
+        Name       = [System.IO.Path]::GetFileNameWithoutExtension($CompilerPath)
+        Path       = $CompilerPath
+        Style      = $Style
+        DriverMode = $DriverMode
+        Source     = 'Defender trace workload'
+    }
+    $project = New-CompileBenchProject -Root $Root -TuCount $TuCount -HeaderCount $HeaderCount
+    Invoke-CompilePass -Toolchain $toolchain -Project $project -ObjDir (Join-Path $Root 'obj-trace') -JobCount 1
+}
+
+function Get-BuildScanMs {
+    # Scan time Defender spent on behalf of the compiler process, from the
+    # trace's TopProcesses. This is a direct measurement of what scanning costs
+    # the build, as opposed to inferring it from a timing ratio.
+    param(
+        [object[]]$TopProcesses = @(),
+        [Parameter(Mandatory)][string]$CompilerPath
+    )
+    $leaf = [System.IO.Path]::GetFileName($CompilerPath)
+    $total = 0.0
+    foreach ($p in $TopProcesses) {
+        if ($null -eq $p) { continue }
+        $props = $p.PSObject.Properties
+        if (-not $props['ProcessPath']) { continue }
+        $path = $p.ProcessPath
+        if (-not $path) { continue }
+        if ($path -eq $CompilerPath -or [System.IO.Path]::GetFileName($path) -eq $leaf) {
+            $total += (Get-TraceDurationMs -Entry $p)
+        }
+    }
+    [math]::Round($total, 1)
+}
+
+function Get-BuildScanShareVerdict {
+    # The signal the repeat-pass ratio was meant to be, measured rather than
+    # inferred: what fraction of compile wall time Defender spent scanning for
+    # the compiler. Requires -DefenderTrace; there is no proxy for it.
+    param(
+        [Parameter(Mandatory)][double]$ScanMs,
+        [Parameter(Mandatory)][double]$CompileMs,
+        [string]$CompilerName = 'the compiler'
+    )
+    if ($CompileMs -le 0) {
+        return New-DiagResult -Name 'Scan time attributable to the build' -Category 'Benchmark' -Severity 'Skipped' `
+            -Evidence @('The traced compile reported no elapsed time, so a share cannot be computed.')
+    }
+    $share = [math]::Round(($ScanMs / $CompileMs) * 100, 1)
+    $evidence = @(
+        "Defender scan time on behalf of ${CompilerName}: $ScanMs ms",
+        "Traced compile wall time: $CompileMs ms",
+        "Share of build time spent in Defender scanning: $share%",
+        'Measured from the Defender trace, not inferred from timings. This is the number an exclusions request should be argued on.',
+        'Heuristic reference: under 5% means scanning is not the bottleneck; above 20% means exclusions would pay for themselves'
+    )
+    $headline = "$share% of compile time in Defender scanning"
+    if ($share -gt 20) {
+        New-DiagResult -Name 'Scan time attributable to the build' -Category 'Benchmark' -Severity 'Problem' `
+            -Evidence $evidence -Headline $headline `
+            -Recommendation 'Real-time scanning is taking a substantial share of build time. Request Defender exclusions for the toolchain processes and build directories; this measurement is the evidence.'
+    } elseif ($share -gt 5) {
+        New-DiagResult -Name 'Scan time attributable to the build' -Category 'Benchmark' -Severity 'Warning' `
+            -Evidence $evidence -Headline $headline `
+            -Recommendation 'Scanning is a measurable but not dominant share of build time. Exclusions would help modestly; weigh that against the reduction in coverage.'
+    } else {
+        New-DiagResult -Name 'Scan time attributable to the build' -Category 'Benchmark' -Severity 'OK' `
+            -Evidence $evidence -Headline $headline
+    }
+}
+
+function Get-CompileBenchVerdict {
+    param([Parameter(Mandatory)][object]$Bench)
+
+    $perTu = [math]::Round($Bench.ColdMs / [double]$Bench.TuCount, 1)
+    $warmSpeedup = if ($Bench.WarmMs -gt 0) { [math]::Round($Bench.ColdMs / [double]$Bench.WarmMs, 2) } else { 0 }
+    $parSpeedup  = if ($Bench.ParallelMs -gt 0) { [math]::Round($Bench.ColdMs / [double]$Bench.ParallelMs, 2) } else { 0 }
+    $efficiency  = if ($Bench.JobCount -gt 0) { [math]::Round($parSpeedup / [double]$Bench.JobCount, 2) } else { 0 }
+
+    $results = @()
+
+    # Thresholds raised after measurement on a 12700K: clang-cl over eight
+    # headers that each pull in five standard-library headers runs ~440 ms/TU
+    # with no interference at all, which the original 400 ms Warning flagged as
+    # a fault. They still want calibration across more machines and compilers.
+    $throughput = @(
+        "Compiler: $($Bench.CompilerName) - $($Bench.CompilerPath)",
+        "Toolchain resolved by: $($Bench.ToolchainSource)",
+        "Compiled $($Bench.TuCount) translation units sequentially in $($Bench.ColdMs) ms ($perTu ms/TU, first pass)",
+        'Heuristic reference: 400-900 ms/TU is normal for this generated project on a modern desktop CPU; above 1800 ms/TU indicates heavy per-file or per-process interference',
+        'These thresholds are compiler- and CPU-dependent and are not yet calibrated across a range of machines - read them alongside the scan-time measurement, not on their own'
+    )
+    if ($perTu -gt 1800) {
+        $results += New-DiagResult -Name 'Compile throughput' -Category 'Benchmark' -Severity 'Problem' `
+            -Evidence $throughput -Headline "$perTu ms/TU with $($Bench.CompilerName)" `
+            -Recommendation 'Compilation is slow enough to dominate build time. Run again with -DefenderTrace to measure how much of it is scanning before concluding anything.'
+    } elseif ($perTu -gt 900) {
+        $results += New-DiagResult -Name 'Compile throughput' -Category 'Benchmark' -Severity 'Warning' `
+            -Evidence $throughput -Headline "$perTu ms/TU with $($Bench.CompilerName)" `
+            -Recommendation 'Compilation is slower than this hardware should manage. Run again with -DefenderTrace to see how much of it is scanning.'
+    } else {
+        $results += New-DiagResult -Name 'Compile throughput' -Category 'Benchmark' -Severity 'OK' `
+            -Evidence $throughput -Headline "$perTu ms/TU with $($Bench.CompilerName)"
+    }
+
+    # Reported, never a verdict. A full recompile is CPU-bound on parsing, so a
+    # repeat pass has almost no I/O to save even on a machine with no scanning
+    # at all - measured at 1.00x on a machine whose trace showed Defender taking
+    # under 2% of build time. The ratio cannot separate parse cost from scan
+    # cost, so it is evidence for a human, not a threshold.
+    $results += New-DiagResult -Name 'Compile repeat-pass timing' -Category 'Benchmark' -Severity 'Info' `
+        -Headline "Repeat-pass speedup ${warmSpeedup}x" `
+        -Evidence @(
+            "First pass: $($Bench.ColdMs) ms; immediate repeat of the same sources: $($Bench.WarmMs) ms",
+            "Repeat-pass speedup: ${warmSpeedup}x",
+            'Context only. A rebuild is dominated by parsing rather than I/O, so a ratio near 1.00x is expected even on a healthy machine and does NOT by itself indicate antivirus interference.',
+            'To measure scanning cost directly, run with -DefenderTrace and read the "Scan time attributable to the build" finding.'
+        )
+
+    $parallel = @(
+        "Sequential: $($Bench.ColdMs) ms; $($Bench.JobCount) concurrent jobs: $($Bench.ParallelMs) ms",
+        "Speedup: ${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)",
+        'Heuristic reference: efficiency below 0.40 suggests a serialising bottleneck - AV/EDR contention, disk, or thermal throttling'
+    )
+    if ($efficiency -lt 0.40) {
+        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'Warning' -Evidence $parallel -Headline "${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)" `
+            -Recommendation 'Parallel builds are not scaling with core count. Check the power and throttling findings, then AV/EDR contention.'
+    } else {
+        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'OK' -Evidence $parallel -Headline "${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)"
+    }
+
+    $results
+}
+
+function Get-LinkBenchVerdict {
+    param([Parameter(Mandatory)][object]$Bench)
+
+    $evidence = @(
+        "Linked $($Bench.ObjectCount) objects into one executable in $($Bench.LinkMs) ms",
+        'Link output is a PE file, which real-time AV inspects far more deeply than object or source files.',
+        'Heuristic reference: healthy < 1500 ms for a project this size; > 4000 ms points at scan-on-write of the produced binary'
+    )
+    if ($Bench.LinkMs -gt 4000) {
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+            -Recommendation 'Linking is being heavily penalised. Ask for the build output directory to be excluded from real-time scanning.'
+    } elseif ($Bench.LinkMs -gt 1500) {
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+            -Recommendation 'Link times are elevated; excluding the build output directory should help.'
+    } else {
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+    }
+}
+
+function Get-CompileBenchResults {
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) "DevMachineDiag-compile-$PID"
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $toolchain = Resolve-CompileToolchain -Override $CompileBenchCompiler
+        Write-Host "Compile benchmark: using $($toolchain.Name) ($($toolchain.Source))..." -ForegroundColor Cyan
+        $project = New-CompileBenchProject -Root $root -TuCount $CompileBenchTuCount -HeaderCount $CompileBenchHeaderCount
+        Test-CompileToolchain -Toolchain $toolchain -Project $project -ObjDir (Join-Path $root 'preflight')
+
+        $cold = Invoke-CompilePass -Toolchain $toolchain -Project $project -ObjDir (Join-Path $root 'obj-cold') -JobCount 1
+        $warm = Invoke-CompilePass -Toolchain $toolchain -Project $project -ObjDir (Join-Path $root 'obj-warm') -JobCount 1
+        $jobs = [math]::Min([System.Environment]::ProcessorCount, 8)
+        $par  = Invoke-CompilePass -Toolchain $toolchain -Project $project -ObjDir (Join-Path $root 'obj-par') -JobCount $jobs
+        $link = Invoke-LinkBenchmark -Toolchain $toolchain -ObjDir $cold.ObjDir -ExePath (Join-Path $root 'benchout.exe')
+
+        $bench = [pscustomobject]@{
+            CompilerName    = $toolchain.Name
+            CompilerPath    = $toolchain.Path
+            ToolchainSource = $toolchain.Source
+            TuCount         = $project.TuCount
+            ColdMs          = $cold.ElapsedMs
+            WarmMs          = $warm.ElapsedMs
+            ParallelMs      = $par.ElapsedMs
+            JobCount        = $jobs
+            LinkMs          = $link.ElapsedMs
+            ObjectCount     = $link.ObjectCount
+        }
+        @(Get-CompileBenchVerdict -Bench $bench) + @(Get-LinkBenchVerdict -Bench $bench)
+    } finally {
+        Remove-Item -Path $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ---------- Defender performance trace (optional, -DefenderTrace) ----------
 
 function Get-TraceDurationMs {
@@ -821,22 +1379,54 @@ function Get-DefenderTraceResults {
     New-Item -ItemType Directory -Path $benchRoot -Force | Out-Null
     $job = $null
     try {
-        Write-Host 'Recording Defender activity for 30 s while re-running the file benchmark...' -ForegroundColor Cyan
+        # With -CompileBench, record over the compile workload instead. Attributing
+        # scan time to cl.exe, .obj files and real header paths is far stronger
+        # evidence for an exclusions request than synthetic blobs are, and it is
+        # what makes the scan-share measurement below possible.
+        $traceToolchain = $null
+        if ($CompileBench) {
+            try { $traceToolchain = Resolve-CompileToolchain -Override $CompileBenchCompiler }
+            catch { $traceToolchain = $null }
+        }
+        $workloadName = if ($traceToolchain) { "compile benchmark ($($traceToolchain.Name))" } else { 'file benchmark' }
+        Write-Host "Recording Defender activity for 30 s while re-running the $workloadName..." -ForegroundColor Cyan
         $job = Start-Job -ScriptBlock {
-            param($ScriptPath, $Dir, $Count)
+            param($ScriptPath, $Dir, $Count, $CompilerPath, $Style, $DriverMode, $TuCount, $HeaderCount)
             . $ScriptPath -LibraryMode
-            Invoke-SmallFileBenchmark -WorkDir $Dir -FileCount $Count | Out-Null
-        } -ArgumentList $PSCommandPath, $benchRoot, $BenchFileCount
+            if ($CompilerPath) {
+                Invoke-CompileTraceWorkload -Root $Dir -CompilerPath $CompilerPath -Style $Style `
+                    -DriverMode $DriverMode -TuCount $TuCount -HeaderCount $HeaderCount
+            } else {
+                Invoke-SmallFileBenchmark -WorkDir $Dir -FileCount $Count | Out-Null
+            }
+        } -ArgumentList $PSCommandPath, $benchRoot, $BenchFileCount,
+            $(if ($traceToolchain) { $traceToolchain.Path } else { '' }),
+            $(if ($traceToolchain) { $traceToolchain.Style } else { '' }),
+            $(if ($traceToolchain) { $traceToolchain.DriverMode } else { '' }),
+            $CompileBenchTuCount, $CompileBenchHeaderCount
         New-MpPerformanceRecording -RecordTo $etl -Seconds 30 | Out-Null
         Wait-Job $job -Timeout 60 | Out-Null
+        $workloadResult = @(Receive-Job $job -ErrorAction SilentlyContinue |
+            Where-Object { $null -ne $_ -and $_.PSObject.Properties['ElapsedMs'] }) | Select-Object -First 1
+
         $report = Get-MpPerformanceReport -Path $etl -TopFiles 5 -TopProcesses 5 -TopExtensions 5
         $evidence = Format-DefenderTraceEvidence `
             -TopFiles @($report.TopFiles) `
             -TopProcesses @($report.TopProcesses) `
             -TopExtensions @($report.TopExtensions)
-        New-DiagResult -Name 'Defender performance trace' -Category 'Security' -Severity 'Info' `
-            -Evidence $evidence `
-            -Recommendation 'This is first-party Microsoft data on what Defender spent scan time on. If build files/toolchain dominate, it directly justifies the exclusion request.'
+        $evidence = @("Workload traced: $workloadName") + $evidence
+
+        $results = @(
+            New-DiagResult -Name 'Defender performance trace' -Category 'Security' -Severity 'Info' `
+                -Evidence $evidence `
+                -Recommendation 'This is first-party Microsoft data on what Defender spent scan time on. If build files/toolchain dominate, it directly justifies the exclusion request.'
+        )
+        if ($traceToolchain -and $workloadResult) {
+            $scanMs = Get-BuildScanMs -TopProcesses @($report.TopProcesses) -CompilerPath $traceToolchain.Path
+            $results += Get-BuildScanShareVerdict -ScanMs $scanMs `
+                -CompileMs ([double]$workloadResult.ElapsedMs) -CompilerName $traceToolchain.Name
+        }
+        $results
     } finally {
         if ($job) {
             Stop-Job $job -ErrorAction SilentlyContinue
@@ -871,6 +1461,9 @@ function Invoke-Main {
     $results += Invoke-DiagCheck -Name 'Pending reboot' -Category 'OS' -Body { Get-PendingRebootResults }
     Write-Host 'Running benchmarks (moderate disk/CPU load for a minute or two)...' -ForegroundColor Cyan
     $results += Invoke-DiagCheck -Name 'Benchmarks' -Category 'Benchmark' -Body { Get-BenchmarkResults }
+    if ($CompileBench) {
+        $results += Invoke-DiagCheck -Name 'Compile benchmark' -Category 'Benchmark' -Body { Get-CompileBenchResults }
+    }
     if ($DefenderTrace) {
         $results += Invoke-DiagCheck -Name 'Defender performance trace' -Category 'Security' -Body { Get-DefenderTraceResults }
     }
