@@ -30,7 +30,10 @@ function New-DiagResult {
         [Parameter(Mandatory)][string]$Category,
         [Parameter(Mandatory)][ValidateSet('Problem','Warning','Info','OK','Skipped')][string]$Severity,
         [string[]]$Evidence = @(),
-        [string]$Recommendation = ''
+        [string]$Recommendation = '',
+        # The one measurement that makes this finding make sense, for the summary
+        # table. Falls back to the first evidence line when not set.
+        [string]$Headline = ''
     )
     [pscustomobject]@{
         Name           = $Name
@@ -38,6 +41,7 @@ function New-DiagResult {
         Severity       = $Severity
         Evidence       = $Evidence
         Recommendation = $Recommendation
+        Headline       = $Headline
     }
 }
 
@@ -58,13 +62,76 @@ function Invoke-DiagCheck {
     }
 }
 
+function Get-DiagHeadline {
+    param([Parameter(Mandatory)][object]$Result)
+    if ($Result.PSObject.Properties['Headline'] -and $Result.Headline) { return $Result.Headline }
+    $evidence = @($Result.Evidence)
+    if ($evidence.Count -gt 0) { return $evidence[0] }
+    ''
+}
+
+function Format-DiagSummary {
+    param(
+        [Parameter(Mandatory)][object[]]$Sorted,
+        [Parameter(Mandatory)][string]$ComputerName
+    )
+    $problems = @($Sorted | Where-Object { $_.Severity -eq 'Problem' })
+    $warnings = @($Sorted | Where-Object { $_.Severity -eq 'Warning' })
+    $okCount = @($Sorted | Where-Object { $_.Severity -eq 'OK' }).Count
+    $skipped = @($Sorted | Where-Object { $_.Severity -eq 'Skipped' })
+
+    $tail = "$okCount checks passed"
+    if ($skipped.Count -gt 0) { $tail += ", $($skipped.Count) could not run" }
+    $tail += '.'
+
+    $lines = @('## Summary', '')
+    if ($problems.Count -eq 0 -and $warnings.Count -eq 0) {
+        $lines += "Nothing to fix on $ComputerName. $tail"
+    } else {
+        $bits = @()
+        if ($problems.Count -gt 0) { $bits += "$($problems.Count) problem$(if ($problems.Count -ne 1) { 's' })" }
+        if ($warnings.Count -gt 0) { $bits += "$($warnings.Count) warning$(if ($warnings.Count -ne 1) { 's' })" }
+        $lines += "$($bits -join ' and ') on $ComputerName. $tail"
+        $lines += ''
+        $lines += '| Severity | Finding | Key measurement |'
+        $lines += '| --- | --- | --- |'
+        foreach ($r in ($problems + $warnings)) {
+            $headline = (Get-DiagHeadline -Result $r) -replace '\|', '\|'
+            $lines += "| $($r.Severity) | $($r.Name) ($($r.Category)) | $headline |"
+        }
+
+        $actions = @()
+        foreach ($r in ($problems + $warnings)) {
+            if ($r.Recommendation -and ($actions -notcontains $r.Recommendation)) {
+                $actions += $r.Recommendation
+            }
+        }
+        if ($actions.Count -gt 0) {
+            $lines += ''
+            $lines += '### Recommended actions, most important first'
+            $lines += ''
+            for ($i = 0; $i -lt $actions.Count; $i++) {
+                $lines += "$($i + 1). $($actions[$i])"
+            }
+        }
+    }
+    if ($skipped.Count -gt 0) {
+        $lines += ''
+        $names = ($skipped | ForEach-Object { $_.Name }) -join ', '
+        $lines += "Could not run: $names. See the Skipped section for why."
+    }
+    $lines += ''
+    $lines += 'Full evidence for every check follows.'
+    $lines
+}
+
 function Format-DiagReport {
     param(
         [Parameter(Mandatory)][object[]]$Results,
         [Parameter(Mandatory)][string]$ComputerName,
         [Parameter(Mandatory)][datetime]$Timestamp
     )
-    $sorted = $Results | Sort-Object { $script:SeverityOrder[$_.Severity] }, Category
+    $sorted = @($Results | Sort-Object { $script:SeverityOrder[$_.Severity] }, Category)
     $counts = ($Results | Group-Object Severity |
         Sort-Object { $script:SeverityOrder[$_.Name] } |
         ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', '
@@ -75,8 +142,10 @@ function Format-DiagReport {
         'This tool is read-only; see RISK-ASSESSMENT.md. Report may contain machine'
         'names and file paths - treat as internal, share with IT only.'
         ''
-        "**Summary:** $counts"
+        "**Checks:** $counts"
+        ''
     )
+    $lines += Format-DiagSummary -Sorted $sorted -ComputerName $ComputerName
     foreach ($sev in 'Problem','Warning','Info','OK','Skipped') {
         $group = @($sorted | Where-Object { $_.Severity -eq $sev })
         if ($group.Count -eq 0) { continue }
@@ -534,7 +603,7 @@ function Get-DefenderResults {
         $evidence += 'Note: exclusion lists can be hidden from local admins by policy (HideExclusionsFromLocalAdmins) - zero configured exclusions may not be real; confirm with IT.'
     }
     if (@($gaps.UncoveredRoots).Count -gt 0 -or @($gaps.UncoveredProcesses).Count -gt 3) {
-        New-DiagResult -Name 'Defender exclusion gaps' -Category 'Security' -Severity 'Problem' -Evidence $evidence `
+        New-DiagResult -Name 'Defender exclusion gaps' -Category 'Security' -Severity 'Problem' -Evidence $evidence -Headline "$(@($gaps.UncoveredRoots).Count) dev directories and $(@($gaps.UncoveredProcesses).Count) toolchain processes not excluded" `
             -Recommendation 'Ask IT to add Defender exclusions for the dev/build directories and toolchain processes listed above. Microsoft documents this for dev machines: https://learn.microsoft.com/en-us/defender-endpoint/configure-exclusions-microsoft-defender-antivirus'
     } else {
         New-DiagResult -Name 'Defender exclusions' -Category 'Security' -Severity 'OK' -Evidence $evidence
