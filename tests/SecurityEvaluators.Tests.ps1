@@ -2,6 +2,36 @@ BeforeAll {
     . $PSScriptRoot/../Diagnose-DevMachine.ps1 -LibraryMode
 }
 
+Describe 'Select-RealExclusions' {
+    It 'drops the placeholder Windows returns to an unelevated caller' {
+        # Regression: unelevated, Get-MpPreference returns this string rather
+        # than failing, and it was being counted as a configured exclusion -
+        # overstating coverage and suppressing the "may not be real" note.
+        (Select-RealExclusions -Values @('N/A: Must be an administrator to view exclusions')).Count | Should -Be 0
+    }
+    It 'drops nulls and empties without dropping real paths' {
+        $kept = Select-RealExclusions -Values @($null, '', 'C:\dev', 'C:\src')
+        $kept | Should -Be @('C:\dev', 'C:\src')
+    }
+    It 'returns a countable array even when everything is filtered out' {
+        # Without the comma operator an empty result unrolls to $null, and
+        # StrictMode turns the caller's .Count into a terminating error.
+        $empty = Select-RealExclusions -Values @()
+        $empty -is [array] | Should -BeTrue
+        $empty.Count | Should -Be 0
+    }
+}
+
+Describe 'Test-ExclusionsWithheld' {
+    It 'detects the unelevated placeholder' {
+        Test-ExclusionsWithheld -Values @('N/A: Must be an administrator to view exclusions') | Should -BeTrue
+    }
+    It 'is false for a genuinely empty list and for real exclusions' {
+        Test-ExclusionsWithheld -Values @() | Should -BeFalse
+        Test-ExclusionsWithheld -Values @('C:\dev') | Should -BeFalse
+    }
+}
+
 Describe 'Get-DefenderExclusionGaps' {
     It 'flags dev roots and toolchain processes with no covering exclusion' {
         $gaps = Get-DefenderExclusionGaps -ExclusionPaths @('C:\other') -ExclusionProcesses @() `

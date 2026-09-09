@@ -48,7 +48,10 @@ function Invoke-DiagCheck {
         [Parameter(Mandatory)][scriptblock]$Body
     )
     try {
-        & $Body
+        # Filtered because a collector that calls a chatty cmdlet without
+        # suppressing it would otherwise put stray objects into the results
+        # array and break report rendering at the very end of the run.
+        & $Body | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Severity'] }
     } catch {
         New-DiagResult -Name $Name -Category $Category -Severity 'Skipped' `
             -Evidence @("Check failed: $($_.Exception.Message)")
@@ -116,6 +119,24 @@ $script:DevRootCandidates = @(
     "$env:USERPROFILE\Projects","$env:USERPROFILE\Development",
     "$env:USERPROFILE\Documents\GitHub","$env:USERPROFILE\source\repos"
 )
+
+function Select-RealExclusions {
+    # Run unelevated, Get-MpPreference does not fail - it returns the literal
+    # string "N/A: Must be an administrator to view exclusions" in place of each
+    # list. Counting that as a configured exclusion overstates coverage and
+    # suppresses the "zero exclusions may not be real" note exactly when it is
+    # most warranted. Get-MpPreference also returns $null rather than an empty
+    # array when nothing is configured, and @($null).Count is 1.
+    param([object[]]$Values = @())
+    # Comma operator: an empty array would otherwise unroll to $null on return,
+    # and StrictMode makes .Count on that a terminating error at the call site.
+    , @($Values | Where-Object { $_ -and ($_ -notmatch '^\s*N/A:\s*Must be an administrator') })
+}
+
+function Test-ExclusionsWithheld {
+    param([object[]]$Values = @())
+    @($Values | Where-Object { $_ -match '^\s*N/A:\s*Must be an administrator' }).Count -gt 0
+}
 
 function Get-DefenderExclusionGaps {
     param(
@@ -487,9 +508,11 @@ function Get-DefenderResults {
     # Get-MpPreference returns $null (not an empty array) when no exclusions
     # are configured; @($null).Count is 1, so filter out empty/null entries
     # before counting or handing the lists to the gap analysis.
-    $exclusionPaths = @($prefs.ExclusionPath | Where-Object { $_ })
-    $exclusionProcesses = @($prefs.ExclusionProcess | Where-Object { $_ })
-    $exclusionExtensions = @($prefs.ExclusionExtension | Where-Object { $_ })
+    $exclusionPaths = Select-RealExclusions -Values @($prefs.ExclusionPath)
+    $exclusionProcesses = Select-RealExclusions -Values @($prefs.ExclusionProcess)
+    $exclusionExtensions = Select-RealExclusions -Values @($prefs.ExclusionExtension)
+    $exclusionsWithheld = (Test-ExclusionsWithheld -Values @($prefs.ExclusionPath)) -or
+                          (Test-ExclusionsWithheld -Values @($prefs.ExclusionProcess))
     $gaps = Get-DefenderExclusionGaps `
         -ExclusionPaths $exclusionPaths `
         -ExclusionProcesses $exclusionProcesses `
@@ -505,7 +528,9 @@ function Get-DefenderResults {
         "Dev directories present but NOT excluded: $rootsText"
         "Toolchain processes NOT excluded: $procsText"
     )
-    if ($exclusionPaths.Count -eq 0 -and $exclusionProcesses.Count -eq 0) {
+    if ($exclusionsWithheld) {
+        $evidence += 'Note: Windows withheld the exclusion lists from this run because it is not elevated. The counts above are 0 because the lists were unreadable, not because no exclusions are configured - re-run elevated for a real answer.'
+    } elseif ($exclusionPaths.Count -eq 0 -and $exclusionProcesses.Count -eq 0) {
         $evidence += 'Note: exclusion lists can be hidden from local admins by policy (HideExclusionsFromLocalAdmins) - zero configured exclusions may not be real; confirm with IT.'
     }
     if (@($gaps.UncoveredRoots).Count -gt 0 -or @($gaps.UncoveredProcesses).Count -gt 3) {
@@ -665,6 +690,34 @@ function Get-BenchmarkResults {
 
 # ---------- Defender performance trace (optional, -DefenderTrace) ----------
 
+function Get-TraceDurationMs {
+    # Get-MpPerformanceReport reports durations as TimeSpan (TotalDuration), not
+    # as a millisecond number. Accepts either shape, and a plain number, so the
+    # formatter does not depend on one Defender version's property names.
+    param([object]$Entry)
+    if ($null -eq $Entry) { return 0 }
+    $props = $Entry.PSObject.Properties
+    foreach ($name in 'TotalDurationMs', 'TotalDuration', 'Duration') {
+        if ($props[$name]) {
+            $value = $Entry.$name
+            if ($null -eq $value) { continue }
+            if ($value -is [timespan]) { return $value.TotalMilliseconds }
+            return [double]$value
+        }
+    }
+    0
+}
+
+function Get-TraceScanCount {
+    param([object]$Entry)
+    if ($null -eq $Entry) { return 0 }
+    $props = $Entry.PSObject.Properties
+    foreach ($name in 'Count', 'ScanCount') {
+        if ($props[$name] -and $null -ne $Entry.$name) { return [int]$Entry.$name }
+    }
+    0
+}
+
 function Format-DefenderTraceEvidence {
     param([object[]]$TopFiles = @(), [object[]]$TopProcesses = @(), [object[]]$TopExtensions = @())
     if (@($TopFiles).Count -eq 0 -and @($TopProcesses).Count -eq 0 -and @($TopExtensions).Count -eq 0) {
@@ -672,13 +725,19 @@ function Format-DefenderTraceEvidence {
     } else {
         $evidence = @()
         foreach ($f in $TopFiles) {
-            $evidence += "Scanned file: $($f.Path) - $([math]::Round($f.TotalDurationMs)) ms total scan time"
+            $scans = Get-TraceScanCount -Entry $f
+            $suffix = if ($scans -gt 0) { " over $scans scans" } else { '' }
+            $evidence += "Scanned file: $($f.Path) - $([math]::Round((Get-TraceDurationMs -Entry $f))) ms total scan time$suffix"
         }
         foreach ($p in $TopProcesses) {
-            $evidence += "Scanned on behalf of process: $($p.ProcessPath) - $([math]::Round($p.TotalDurationMs)) ms"
+            $scans = Get-TraceScanCount -Entry $p
+            $suffix = if ($scans -gt 0) { " over $scans scans" } else { '' }
+            $evidence += "Scanned on behalf of process: $($p.ProcessPath) - $([math]::Round((Get-TraceDurationMs -Entry $p))) ms$suffix"
         }
         foreach ($e in $TopExtensions) {
-            $evidence += "Extension $($e.Extension) - $([math]::Round($e.TotalDurationMs)) ms"
+            $scans = Get-TraceScanCount -Entry $e
+            $suffix = if ($scans -gt 0) { " over $scans scans" } else { '' }
+            $evidence += "Extension $($e.Extension) - $([math]::Round((Get-TraceDurationMs -Entry $e))) ms$suffix"
         }
         $evidence
     }
@@ -699,7 +758,7 @@ function Get-DefenderTraceResults {
             . $ScriptPath -LibraryMode
             Invoke-SmallFileBenchmark -WorkDir $Dir -FileCount $Count | Out-Null
         } -ArgumentList $PSCommandPath, $benchRoot, $BenchFileCount
-        New-MpPerformanceRecording -RecordTo $etl -Seconds 30
+        New-MpPerformanceRecording -RecordTo $etl -Seconds 30 | Out-Null
         Wait-Job $job -Timeout 60 | Out-Null
         $report = Get-MpPerformanceReport -Path $etl -TopFiles 5 -TopProcesses 5 -TopExtensions 5
         $evidence = Format-DefenderTraceEvidence `

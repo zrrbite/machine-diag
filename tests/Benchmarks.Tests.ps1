@@ -21,7 +21,13 @@ Describe 'Invoke-SmallFileBenchmark' {
 
 Describe 'Invoke-ProcessSpawnBenchmark' {
     It 'spawns processes and reports per-spawn time' {
-        $bench = Invoke-ProcessSpawnBenchmark -SpawnCount 5 -Command '/bin/sh' -Arguments '-c "exit 0"'
+        # The function defaults to cmd.exe; callers pass the POSIX command
+        # explicitly, so the test has to branch the same way Get-BenchmarkResults does.
+        $bench = if ($script:OnWindows) {
+            Invoke-ProcessSpawnBenchmark -SpawnCount 5
+        } else {
+            Invoke-ProcessSpawnBenchmark -SpawnCount 5 -Command '/bin/sh' -Arguments '-c "exit 0"'
+        }
         $bench.SpawnCount | Should -Be 5
         $bench.TotalMs | Should -BeGreaterThan 0
         $bench.PerSpawnMs | Should -BeGreaterThan 0
