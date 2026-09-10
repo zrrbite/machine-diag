@@ -67,12 +67,15 @@ no exclusions, and no third-party EDR:
 
 | Measurement | Desktop, i7-12700K (12c/20t), NVMe |
 | --- | --- |
-| Compile throughput | 440 ms/TU (clang-cl) |
-| Parallel compile scaling | 6.52x across 8 jobs (efficiency 0.82) |
-| Small-file I/O | 0.59 ms/file write |
-| Process spawn | 23 ms/spawn |
-| Link | 31 objects in 134 ms |
-| Scan time attributable to the build | 1.7% |
+| Compile throughput | 441 ms/TU (clang-cl) |
+| Parallel compile scaling | 6.19x on 8 cores (efficiency 0.77) |
+| Small-file I/O | 0.58 ms/file write |
+| Process spawn | 22.6 ms/spawn |
+| Link | 31 objects in 146 ms |
+| Scan time attributable to the build | 1.8% |
+
+Run-to-run variation on an otherwise idle machine is a few percent; treat a
+difference under about 10% as noise.
 
 ### What to expect on different machines
 

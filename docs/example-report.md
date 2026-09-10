@@ -16,7 +16,7 @@ Two things worth noticing in it:
 
 - The one Problem is the Defender exclusion gap, which is a configuration
   finding rather than a measured one.
-- "Scan time attributable to the build" is 1.7%. Scanning is genuinely not
+- "Scan time attributable to the build" is 1.8%. Scanning is genuinely not
   this machine's bottleneck, despite there being no exclusions at all. That
   number is the one to argue an exclusions request on; the timing-only figures
   cannot separate scanning cost from ordinary compiler work.
@@ -25,7 +25,7 @@ Two things worth noticing in it:
 
 # Dev machine diagnostic - ZRRBITE-PC
 
-Generated 2026-09-10 07:21 by Diagnose-DevMachine.ps1.
+Generated 2026-09-10 07:34 by Diagnose-DevMachine.ps1.
 This tool is read-only; see RISK-ASSESSMENT.md. Report may contain machine
 names and file paths - treat as internal, share with IT only.
 
@@ -55,13 +55,13 @@ Full evidence for every check follows.
 
 | Measurement | Result | Verdict |
 | --- | --- | --- |
-| Compile repeat-pass timing | Repeat-pass speedup 1.01x | Info |
-| Compile throughput | 440.2 ms/TU with clang-cl | OK |
-| Link benchmark | 31 objects in 134.4 ms | OK |
-| Parallel compile scaling | 6.52x across 8 jobs (efficiency 0.82) | OK |
-| Process-spawn benchmark | 23 ms/spawn | OK |
-| Scan time attributable to the build | 1.7% of compile time in Defender scanning | OK |
-| Small-file I/O benchmark | 0.59 ms/file write | OK |
+| Compile repeat-pass timing | Repeat-pass speedup 1x | Info |
+| Compile throughput | 440.7 ms/TU with clang-cl | OK |
+| Link benchmark | 31 objects in 146 ms | OK |
+| Parallel compile scaling | 6.19x on 8 cores (efficiency 0.77) | OK |
+| Process-spawn benchmark | 22.6 ms/spawn | OK |
+| Scan time attributable to the build | 1.8% of compile time in Defender scanning | OK |
+| Small-file I/O benchmark | 0.58 ms/file write | OK |
 
 Reference numbers from a known-good machine are in the project README.
 
@@ -98,8 +98,8 @@ Reference numbers from a known-good machine are in the project README.
 ## Info
 
 ### Compile repeat-pass timing (Benchmark)
-- First pass: 13645.5 ms; immediate repeat of the same sources: 13560.7 ms
-- Repeat-pass speedup: 1.01x
+- First pass: 13661.1 ms; immediate repeat of the same sources: 13635.7 ms
+- Repeat-pass speedup: 1x
 - Context only. A rebuild is dominated by parsing rather than I/O, so a ratio near 1.00x is expected even on a healthy machine and does NOT by itself indicate antivirus interference.
 - To measure scanning cost directly, run with -DefenderTrace and read the "Scan time attributable to the build" finding.
 
@@ -124,21 +124,21 @@ Reference numbers from a known-good machine are in the project README.
 
 ### Defender performance trace (Security)
 - Workload traced: compile benchmark (clang-cl)
-- Scanned file: C:\Users\kjeld\scoop\apps\llvm\22.1.3\bin\clang-cl.exe - 370 ms total scan time over 1 scans
-- Scanned file: C:\ProgramData\Microsoft\Windows\AppRepository\Packages\Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe\machine.pckgdep - 40 ms total scan time over 834 scans
-- Scanned file: C:\ProgramData\Microsoft\Diagnosis\AggregatorStorage\UpdateReboot$ - 21 ms total scan time over 1 scans
-- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-3256\obj-trace\tu14-d5c6d426.obj.tmp - 10 ms total scan time over 1 scans
-- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-3256\obj-trace\tu7-ef198f82.obj.tmp - 9 ms total scan time over 1 scans
-- Scanned on behalf of process:  - 370 ms over 1 scans
-- Scanned on behalf of process: C:\Users\kjeld\scoop\apps\llvm\22.1.3\bin\clang-cl.exe - 224 ms over 31 scans
-- Scanned on behalf of process: C:\Windows\System32\svchost.exe - 42 ms over 846 scans
-- Scanned on behalf of process: C:\Windows\System32\AggregatorHost.exe - 21 ms over 1 scans
-- Scanned on behalf of process: C:\Program Files\Intel\SUR\QUEENCREEK\x64\esrv_svc.exe - 9 ms over 1 scans
-- Extension .exe - 370 ms over 1 scans
-- Extension .tmp - 230 ms over 33 scans
-- Extension .pckgdep - 40 ms over 835 scans
-- Extension  - 21 ms over 1 scans
-- Extension .sdt - 9 ms over 1 scans
+- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-45508\obj-trace\tu10-6316ec59.obj.tmp - 11 ms total scan time over 1 scans
+- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-45508\obj-trace\tu15-0c574abb.obj.tmp - 10 ms total scan time over 1 scans
+- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-45508\obj-trace\tu22-ba563b61.obj.tmp - 10 ms total scan time over 1 scans
+- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-45508\obj-trace\tu19-8a0f78c6.obj.tmp - 10 ms total scan time over 1 scans
+- Scanned file: C:\Users\kjeld\AppData\Local\Temp\DevMachineDiag-trace-bench-45508\obj-trace\tu0-db7edb4d.obj.tmp - 10 ms total scan time over 1 scans
+- Scanned on behalf of process: C:\Users\kjeld\scoop\apps\llvm\22.1.3\bin\clang-cl.exe - 240 ms over 31 scans
+- Scanned on behalf of process: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe - 18 ms over 33 scans
+- Scanned on behalf of process: C:\Program Files (x86)\Dropbox\Client\Dropbox.exe - 9 ms over 1 scans
+- Scanned on behalf of process: C:\Program Files (x86)\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe - 7 ms over 1 scans
+- Scanned on behalf of process: C:\Program Files\Intel\SUR\QUEENCREEK\x64\esrv_svc.exe - 5 ms over 1 scans
+- Extension .tmp - 240 ms over 31 scans
+- Extension .cpp - 17 ms over 31 scans
+- Extension .bin - 9 ms over 1 scans
+- Extension .dat - 7 ms over 1 scans
+- Extension .sdt - 5 ms over 1 scans
 
 **Recommended action:** This is first-party Microsoft data on what Defender spent scan time on. If build files/toolchain dominate, it directly justifies the exclusion request.
 
@@ -151,43 +151,44 @@ Reference numbers from a known-good machine are in the project README.
 ### Compile throughput (Benchmark)
 - Compiler: clang-cl - C:\Users\kjeld\scoop\apps\llvm\current\bin\clang-cl.exe
 - Toolchain resolved by: clang-cl on PATH
-- Compiled 31 translation units sequentially in 13645.5 ms (440.2 ms/TU, first pass)
+- Compiled 31 translation units sequentially in 13661.1 ms (440.7 ms/TU, first pass)
 - Heuristic reference: 400-900 ms/TU is normal for this generated project on a modern desktop CPU; above 1800 ms/TU indicates heavy per-file or per-process interference
 - These thresholds are compiler- and CPU-dependent and are not yet calibrated across a range of machines - read them alongside the scan-time measurement, not on their own
 
 ### Scan time attributable to the build (Benchmark)
-- Defender scan time on behalf of clang-cl: 224.2 ms
-- Traced compile wall time: 13581.7 ms
-- Share of build time spent in Defender scanning: 1.7%
+- Defender scan time on behalf of clang-cl: 239.8 ms
+- Traced compile wall time: 13630.8 ms
+- Share of build time spent in Defender scanning: 1.8%
 - Measured from the Defender trace, not inferred from timings. This is the number an exclusions request should be argued on.
 - Heuristic reference: under 5% means scanning is not the bottleneck; above 20% means exclusions would pay for themselves
 
 ### Link benchmark (Benchmark)
-- Linked 31 objects into one executable in 134.4 ms
+- Linked 31 objects into one executable in 146 ms
 - Link output is a PE file, which real-time AV inspects far more deeply than object or source files.
 - Heuristic reference: healthy < 1500 ms for a project this size; > 4000 ms points at scan-on-write of the produced binary
 
 ### Parallel compile scaling (Benchmark)
-- Sequential: 13645.5 ms; 8 concurrent jobs: 2093.1 ms
-- Speedup: 6.52x across 8 jobs (efficiency 0.82)
-- Heuristic reference: efficiency below 0.40 suggests a serialising bottleneck - AV/EDR contention, disk, or thermal throttling
+- Sequential: 13661.1 ms; 8 concurrent jobs: 2206 ms
+- Speedup: 6.19x - efficiency 0.77 against 8 usable cores (12 physical)
+- Efficiency is measured against physical cores rather than job count or threads. Eight jobs on a four-core laptop cannot exceed roughly 4-5x however healthy the machine is, so dividing by the job count would report a fault on hardware that is behaving correctly.
+- Heuristic reference: efficiency below 0.40 suggests a serialising bottleneck - AV/EDR contention, disk, or thermal throttling. Values near or above 1.0 are normal where hyperthreading is contributing.
 
 ### Small-file I/O benchmark (Benchmark)
-- Wrote 2000 small files in 1171.3 ms (0.59 ms/file)
-- Read back in 738.2 ms; deleted in 322.4 ms
+- Wrote 2000 small files in 1158.5 ms (0.58 ms/file)
+- Read back in 185 ms; deleted in 332.4 ms
 - Heuristic reference: healthy SSD < 2 ms/file write; heavy AV/EDR scanning commonly shows 5-30 ms/file
 
 ### Process-spawn benchmark (Benchmark)
-- Spawned 100 short-lived processes in 2296.5 ms (23 ms/spawn)
+- Spawned 100 short-lived processes in 2256.7 ms (22.6 ms/spawn)
 - Heuristic reference: healthy < 30 ms/spawn; EDR process-hooking overhead commonly shows 100-300 ms/spawn
 
 ### Memory pressure (Memory)
-- 31.8 GB total, 10.9 GB free (34.4%)
-- Top consumer: Memory Compression 2127 MB
-- Top consumer: chrome 557 MB
+- 31.8 GB total, 11.6 GB free (36.6%)
+- Top consumer: Memory Compression 2098 MB
+- Top consumer: chrome 546 MB
+- Top consumer: MsMpEng 501 MB
 - Top consumer: Dropbox 497 MB
-- Top consumer: MsMpEng 494 MB
-- Top consumer: claude 488 MB
+- Top consumer: chrome 482 MB
 
 ### Memory integrity (HVCI) (OS)
 - HVCI not running
