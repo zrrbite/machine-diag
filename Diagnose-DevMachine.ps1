@@ -1218,13 +1218,37 @@ function Get-BuildScanShareVerdict {
     }
 }
 
+function Get-PhysicalCoreCount {
+    # Parallel efficiency has to be judged against real cores, not threads or
+    # job count: eight jobs on a four-core laptop cannot exceed roughly 4-5x
+    # however healthy the machine is, and dividing by the job count would call
+    # that a fault. Falls back to the logical count when the real one is not
+    # obtainable, which is the old behaviour.
+    if (-not $script:OnWindows) { return [System.Environment]::ProcessorCount }
+    try {
+        $sum = (Get-CimInstance Win32_Processor -ErrorAction Stop |
+            Measure-Object -Property NumberOfCores -Sum).Sum
+        if ($sum -and [int]$sum -gt 0) { return [int]$sum }
+    } catch {
+        # Fall through to the logical count.
+    }
+    [System.Environment]::ProcessorCount
+}
+
 function Get-CompileBenchVerdict {
     param([Parameter(Mandatory)][object]$Bench)
 
     $perTu = [math]::Round($Bench.ColdMs / [double]$Bench.TuCount, 1)
     $warmSpeedup = if ($Bench.WarmMs -gt 0) { [math]::Round($Bench.ColdMs / [double]$Bench.WarmMs, 2) } else { 0 }
     $parSpeedup  = if ($Bench.ParallelMs -gt 0) { [math]::Round($Bench.ColdMs / [double]$Bench.ParallelMs, 2) } else { 0 }
-    $efficiency  = if ($Bench.JobCount -gt 0) { [math]::Round($parSpeedup / [double]$Bench.JobCount, 2) } else { 0 }
+    # Divide by usable cores, not job count. On a machine whose job count
+    # exceeds its physical cores the extra jobs are sharing real cores, so the
+    # achievable speedup is bounded by the cores, not by the jobs.
+    $physical = if ($Bench.PSObject.Properties['PhysicalCores'] -and $Bench.PhysicalCores -gt 0) {
+        [int]$Bench.PhysicalCores
+    } else { 0 }
+    $usableCores = if ($physical -gt 0) { [math]::Min($Bench.JobCount, $physical) } else { $Bench.JobCount }
+    $efficiency  = if ($usableCores -gt 0) { [math]::Round($parSpeedup / [double]$usableCores, 2) } else { 0 }
 
     $results = @()
 
@@ -1266,16 +1290,22 @@ function Get-CompileBenchVerdict {
             'To measure scanning cost directly, run with -DefenderTrace and read the "Scan time attributable to the build" finding.'
         )
 
+    $coreNote = if ($physical -gt 0) {
+        "efficiency $efficiency against $usableCores usable cores ($physical physical)"
+    } else {
+        "efficiency $efficiency against $usableCores jobs (physical core count unavailable)"
+    }
     $parallel = @(
         "Sequential: $($Bench.ColdMs) ms; $($Bench.JobCount) concurrent jobs: $($Bench.ParallelMs) ms",
-        "Speedup: ${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)",
-        'Heuristic reference: efficiency below 0.40 suggests a serialising bottleneck - AV/EDR contention, disk, or thermal throttling'
+        "Speedup: ${parSpeedup}x - $coreNote",
+        'Efficiency is measured against physical cores rather than job count or threads. Eight jobs on a four-core laptop cannot exceed roughly 4-5x however healthy the machine is, so dividing by the job count would report a fault on hardware that is behaving correctly.',
+        'Heuristic reference: efficiency below 0.40 suggests a serialising bottleneck - AV/EDR contention, disk, or thermal throttling. Values near or above 1.0 are normal where hyperthreading is contributing.'
     )
     if ($efficiency -lt 0.40) {
-        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'Warning' -Evidence $parallel -Headline "${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)" `
+        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'Warning' -Evidence $parallel -Headline "${parSpeedup}x on $usableCores cores (efficiency $efficiency)" `
             -Recommendation 'Parallel builds are not scaling with core count. Check the power and throttling findings, then AV/EDR contention.'
     } else {
-        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'OK' -Evidence $parallel -Headline "${parSpeedup}x across $($Bench.JobCount) jobs (efficiency $efficiency)"
+        $results += New-DiagResult -Name 'Parallel compile scaling' -Category 'Benchmark' -Severity 'OK' -Evidence $parallel -Headline "${parSpeedup}x on $usableCores cores (efficiency $efficiency)"
     }
 
     $results
@@ -1324,6 +1354,7 @@ function Get-CompileBenchResults {
             WarmMs          = $warm.ElapsedMs
             ParallelMs      = $par.ElapsedMs
             JobCount        = $jobs
+            PhysicalCores   = Get-PhysicalCoreCount
             LinkMs          = $link.ElapsedMs
             ObjectCount     = $link.ObjectCount
         }

@@ -96,13 +96,16 @@ process creation moves them by an order of magnitude. If your laptop is slow
 and the top three rows do not explain it, the agent almost certainly does - and
 the scan-share figure is how you demonstrate that rather than assert it.
 
-**A caveat on parallel efficiency.** Efficiency is speedup divided by job
-count, and the job count is `min(logical processors, 8)`. On a machine whose
-job count exceeds its *physical* cores - any 4-core laptop with hyperthreading -
-the ceiling is structurally around 0.5 to 0.65, because eight jobs are sharing
-four real cores. A laptop scoring 0.55 is not necessarily contended; a desktop
-scoring 0.55 probably is. The 0.40 Warning threshold was set from desktop
-measurements and may want normalising by physical core count.
+**How parallel efficiency is measured.** Efficiency is speedup divided by
+*usable cores* - `min(job count, physical cores)` - not by job count. The job
+count is `min(logical processors, 8)`, so on any 4-core laptop with
+hyperthreading eight jobs share four real cores and the achievable speedup is
+bounded by the cores. Dividing by the job count there would report a fault on
+hardware behaving perfectly, which is what an earlier version of this tool did.
+
+One consequence: on a machine where hyperthreading is contributing, efficiency
+can exceed 1.0. That is normal and not an error - four physical cores really
+can deliver more than 4x when eight jobs are in flight.
 
 ## Running the tests
 

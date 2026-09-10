@@ -1,7 +1,7 @@
 # Compile benchmark (`-CompileBench`) — design
 
 **Date:** 2026-09-09
-**Status:** Approved, amended 2026-09-09 after first measurement (see Amendment)
+**Status:** Approved, amended twice after measurement (see the two Amendment sections)
 
 ## Problem
 
@@ -132,7 +132,10 @@ existing benchmark references are:
   CPU-dependent; reported alongside the compiler name, and not yet
   calibrated across a range of machines.
 - Repeat-pass speedup: reported as `Info`, never a verdict.
-- Parallel efficiency (speedup ÷ job count): `Warning` below 0.40.
+- Parallel efficiency (speedup ÷ *usable cores*, where usable cores is
+  `min(job count, physical cores)`): `Warning` below 0.40. Dividing by job
+  count instead faults any machine whose job count exceeds its physical
+  cores - see the second amendment.
 - Link: `Warning` above 1500 ms, `Problem` above 4000 ms for the generated
   project size.
 
@@ -216,6 +219,32 @@ Changes made:
 The general lesson for future thresholds here: a ratio between two runs of
 the same CPU-bound workload cannot isolate an I/O-side cost. Prefer a
 direct measurement, even when it costs a flag and elevation to obtain.
+
+## Second amendment, 2026-09-10: efficiency must divide by cores, not jobs
+
+Writing the per-configuration expectations for the README surfaced a defect
+the single measured machine had hidden. Parallel efficiency divided speedup
+by job count, and job count is `min(logical processors, 8)`. On the 12700K
+that is 8 jobs across 12 physical cores, so the divisor and the available
+cores happen to agree and the number is meaningful.
+
+They do not agree on a laptop. A 4-core/8-thread machine also runs 8 jobs,
+but across 4 real cores, so its ceiling is roughly 4-5x - an efficiency of
+0.5 to 0.65 by the old formula, with anything slightly below that tipping
+under the 0.40 Warning threshold. The tool would have reported healthy
+laptops as contended, and the target hardware for this tool is laptops.
+
+Efficiency is now speedup divided by `min(job count, physical cores)`, with
+physical cores read from `Win32_Processor.NumberOfCores` summed across
+sockets and falling back to the logical count when unavailable. Machines
+with more physical cores than jobs are unaffected, so the desktop numbers in
+the first amendment still stand. Where hyperthreading contributes, the
+result can exceed 1.0, which is correct rather than anomalous.
+
+The lesson repeats the first amendment's: a threshold validated on one
+machine encodes that machine's incidental properties. Here the coincidence
+was that job count equalled usable cores, which is true only when the
+machine has at least eight physical cores.
 
 ## Out of scope (YAGNI)
 

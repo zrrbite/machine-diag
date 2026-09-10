@@ -4,12 +4,25 @@ BeforeAll {
     function New-TestBench {
         param(
             [double]$ColdMs = 6000, [double]$WarmMs = 3000, [double]$ParallelMs = 1200,
-            [int]$JobCount = 8, [double]$LinkMs = 400, [int]$TuCount = 30, [int]$ObjectCount = 30
+            [int]$JobCount = 8, [double]$LinkMs = 400, [int]$TuCount = 30, [int]$ObjectCount = 30,
+            [int]$PhysicalCores = 12
         )
         [pscustomobject]@{
             CompilerName = 'cl'; CompilerPath = 'C:\tools\cl.exe'; ToolchainSource = 'test fixture'
             TuCount = $TuCount; ColdMs = $ColdMs; WarmMs = $WarmMs; ParallelMs = $ParallelMs
             JobCount = $JobCount; LinkMs = $LinkMs; ObjectCount = $ObjectCount
+            PhysicalCores = $PhysicalCores
+        }
+    }
+
+    function New-LegacyTestBench {
+        # A bench object from before PhysicalCores existed, to prove the verdict
+        # still works when the property is absent.
+        param([double]$ColdMs = 6000, [double]$ParallelMs = 1200, [int]$JobCount = 8)
+        [pscustomobject]@{
+            CompilerName = 'cl'; CompilerPath = 'C:\tools\cl.exe'; ToolchainSource = 'test fixture'
+            TuCount = 30; ColdMs = $ColdMs; WarmMs = 3000; ParallelMs = $ParallelMs
+            JobCount = $JobCount; LinkMs = 400; ObjectCount = 30
         }
     }
 
@@ -169,6 +182,36 @@ Describe 'Get-CompileBenchVerdict' {
         ($v.Evidence -join ' ') | Should -Match '-DefenderTrace'
     }
 
+    It 'does not fault a 4-core laptop for running 8 jobs on 4 real cores' {
+        # Regression: efficiency used to divide by job count, so a laptop that
+        # hit 4.5x - about the ceiling for 4 physical cores - scored 0.56 and
+        # a slightly worse one tipped under 0.40 and was reported as contended.
+        $r = @(Get-CompileBenchVerdict -Bench (New-TestBench -ColdMs 6000 -ParallelMs 1333 -JobCount 8 -PhysicalCores 4))
+        $v = Get-VerdictByName -Results $r -Name 'Parallel compile scaling'
+        $v.Severity | Should -Be 'OK'
+        ($v.Evidence -join ' ') | Should -Match '4 usable cores \(4 physical\)'
+    }
+
+    It 'still warns when a 4-core machine genuinely fails to scale' {
+        $r = @(Get-CompileBenchVerdict -Bench (New-TestBench -ColdMs 6000 -ParallelMs 4000 -JobCount 8 -PhysicalCores 4))
+        (Get-VerdictByName -Results $r -Name 'Parallel compile scaling').Severity | Should -Be 'Warning'
+    }
+
+    It 'is unchanged on a machine with more physical cores than jobs' {
+        # 8 jobs on 12 physical cores: usable cores is still 8, as before.
+        $r = @(Get-CompileBenchVerdict -Bench (New-TestBench -ColdMs 6000 -ParallelMs 1200 -JobCount 8 -PhysicalCores 12))
+        $v = Get-VerdictByName -Results $r -Name 'Parallel compile scaling'
+        $v.Severity | Should -Be 'OK'
+        $v.Headline | Should -Match '5x on 8 cores \(efficiency 0\.62\)'
+    }
+
+    It 'falls back to job count when the physical core count is unavailable' {
+        $r = @(Get-CompileBenchVerdict -Bench (New-LegacyTestBench -ColdMs 6000 -ParallelMs 1200 -JobCount 8))
+        $v = Get-VerdictByName -Results $r -Name 'Parallel compile scaling'
+        $v.Severity | Should -Be 'OK'
+        ($v.Evidence -join ' ') | Should -Match 'physical core count unavailable'
+    }
+
     It 'warns when parallel efficiency falls below 0.40' {
         $r = @(Get-CompileBenchVerdict -Bench (New-TestBench -ColdMs 6000 -ParallelMs 5500 -JobCount 8))
         (Get-VerdictByName -Results $r -Name 'Parallel compile scaling').Severity | Should -Be 'Warning'
@@ -179,6 +222,14 @@ Describe 'Get-CompileBenchVerdict' {
         $v = Get-VerdictByName -Results $r -Name 'Compile throughput'
         ($v.Evidence -join ' ') | Should -Match 'cl'
         ($v.Evidence -join ' ') | Should -Match 'test fixture'
+    }
+}
+
+Describe 'Get-PhysicalCoreCount' {
+    It 'returns a positive count no greater than the logical processor count' {
+        $cores = Get-PhysicalCoreCount
+        $cores | Should -BeGreaterThan 0
+        $cores | Should -BeLessOrEqual ([System.Environment]::ProcessorCount)
     }
 }
 
