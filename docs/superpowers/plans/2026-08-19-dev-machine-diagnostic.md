@@ -1424,5 +1424,5 @@ Expected: empty output.
 
 ## Follow-up (outside this plan)
 
-- Martin runs the script on an actual work Windows machine (elevated, then again with `-DefenderTrace`) and sanity-checks the report; thresholds may need tuning against real numbers. Log this in `~/Development/todo` per global conventions.
+- A colleague runs the script on an actual work Windows machine (elevated, then again with `-DefenderTrace`) and sanity-checks the report; thresholds may need tuning against real numbers. Log this in `~/Development/todo` per global conventions.
 ```

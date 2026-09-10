@@ -129,7 +129,7 @@ Development happens on macOS, so:
   isolated in functions and smoke-tested under `pwsh` where possible.
 - The full script gets a parse/syntax validation locally.
 - Final validation is a real run on a work Windows machine — tracked as a
-  follow-up task for Martin.
+  follow-up task for a colleague.
 
 ## Out of scope (YAGNI)
 
