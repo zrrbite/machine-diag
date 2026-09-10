@@ -2,7 +2,7 @@
 
 Audience: IT / security reviewers deciding whether developers may run
 this script elevated. The script is a single plaintext PowerShell file
-(~1,485 lines, no obfuscation, no embedded binaries, nothing downloaded),
+(~1,720 lines, no obfuscation, no embedded binaries, nothing downloaded),
 so every claim below is verifiable by reading it.
 
 ## Purpose
@@ -45,6 +45,10 @@ fixes; it applies none.
 - With `-CompileBench` only: `PATH` (via `Get-Command`) for a C++ compiler,
   and if none is found, the Visual Studio install location reported by
   `vswhere.exe -property installationPath`.
+- With `-PreFlight` only: the session's PowerShell language mode
+  (`$ExecutionContext.SessionState.LanguageMode`) and the execution policy per
+  scope (`Get-ExecutionPolicy -List`), alongside the Defender running-mode and
+  compiler lookups listed above.
 
 ## What it writes
 
@@ -89,6 +93,16 @@ described above.
 - No persistence: nothing installed, no scheduled tasks, no services,
   nothing left behind except the report the user asked for.
 - No credential or token access.
+
+## Pre-flight mode (`-PreFlight`)
+
+Intended as the first thing a reviewer or user runs on a managed machine. It
+reports whether a full run would work - language mode, execution policy,
+elevation, Defender running mode, compiler availability - prints the result to
+the console, and exits. It runs **no benchmarks, starts no processes, creates
+no files and writes no report**, so it is the cheapest possible way to see what
+this tool would do on a given machine before committing to a full run. Exit
+code 0 means a run will work, 1 means it will not.
 
 ## Executing a compiler (`-CompileBench`)
 

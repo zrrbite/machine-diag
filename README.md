@@ -24,11 +24,55 @@ spends scan time on):
 
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -DefenderTrace
 
-## Before you run it on a managed machine (`-PreFlight`)
+## Running it on a managed machine
 
-On a corporate build, the two things most likely to stop this script are
-policy rather than hardware - and neither is fixed by running elevated. This
-answers that in a couple of seconds, measuring nothing and writing nothing:
+The whole tool is one self-contained file. Copy `Diagnose-DevMachine.ps1` to
+the machine - you do not need the repository, the tests, or anything installed.
+
+1. **Send `RISK-ASSESSMENT.md` to your security team first.** The benchmark
+   writes a few thousand deliberately-unique files and spawns a hundred
+   processes; to a behavioural EDR that is a ransomware-shaped signature. That
+   document is written for exactly this conversation. Do this before the run,
+   not after the alert.
+2. **Open an elevated PowerShell** and change to wherever you put the script.
+3. **Check the machine will cooperate:**
+
+       powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -PreFlight
+
+   Green throughout means go. A red line means stop - see below.
+4. **Run it:**
+
+       powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -CompileBench -DefenderTrace
+
+   Roughly three minutes, with heavy CPU load for about a minute of it. Do not
+   run it during a build or the numbers are meaningless.
+5. **Read the report** written next to the script. It opens with a Summary of
+   what is wrong and what to ask for, then a Measurements table.
+6. **Compare that table** against the reference numbers further down this
+   README, and hand the report to IT.
+
+### If pre-flight reports a blocker
+
+**Constrained Language Mode** - WDAC or AppLocker is enforcing. Nothing you can
+do at the console; ask IT whether the script can run from an allow-listed path,
+or have it signed and allow-listed.
+
+**Execution policy set by Group Policy** - the documented invocation will not
+run whatever your privileges. Same conversation: signing, or an exception.
+
+Neither is fixed by running elevated. Both are policy, not privilege.
+
+### If Defender is in Passive Mode
+
+A third-party agent is the primary scanner, so "Scan time attributable to the
+build" is unavailable and always will be - the instrumentation exists for
+Defender only. Run with `-CompileBench` anyway and make the case from the
+comparison instead: a machine at 200 ms/spawn against this README's 22.6 ms is
+evidence, just less direct than a percentage.
+
+### What `-PreFlight` actually checks
+
+It answers in a couple of seconds, measuring nothing and writing nothing:
 
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -PreFlight
 
