@@ -24,6 +24,45 @@ spends scan time on):
 
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -DefenderTrace
 
+## Before you run it on a managed machine (`-PreFlight`)
+
+On a corporate build, the two things most likely to stop this script are
+policy rather than hardware - and neither is fixed by running elevated. This
+answers that in a couple of seconds, measuring nothing and writing nothing:
+
+    powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -PreFlight
+
+    [WARNING] Elevation: not elevated
+    [OK     ] PowerShell language mode: FullLanguage
+    [OK     ] Execution policy: not blocked by policy
+    [OK     ] Defender running mode: Normal
+    [OK     ] -CompileBench: clang-cl
+
+    Clear to run, with 1 check(s) degraded - see above.
+
+It exits 0 when a run will work and 1 when it will not. What it checks:
+
+- **Language mode.** WDAC or AppLocker can put PowerShell into Constrained
+  Language Mode, which blocks the .NET calls this script is built on. It fails
+  immediately if so, and elevation does not lift it - it is a policy setting,
+  not a privilege one.
+- **Execution policy.** A `MachinePolicy` or `UserPolicy` scope set by Group
+  Policy outranks `-ExecutionPolicy Bypass`, and outranks an elevated session.
+- **Elevation.** Without it, BitLocker is skipped, the exclusion lists are
+  unreadable, and `-DefenderTrace` will not run.
+- **Defender running mode.** If a third-party agent is primary, Defender goes
+  passive and "Scan time attributable to the build" cannot be measured -
+  `New-MpPerformanceRecording` instruments Defender, and there is no equivalent
+  for third-party agents. Every other benchmark still works, so the comparison
+  against the reference numbers below is still the argument you make.
+- **Compiler availability**, so you know in advance whether `-CompileBench`
+  will produce numbers or report Skipped.
+
+A note on managed machines regardless of the above: the benchmark writes a few
+thousand deliberately-unique files and spawns a hundred processes, which is a
+ransomware-shaped signature to a behavioural EDR. Send `RISK-ASSESSMENT.md` to
+your security team before the run rather than after.
+
 ## Measuring real compilation (`-CompileBench`)
 
 The default benchmarks measure compile-*shaped* work: small-file I/O and

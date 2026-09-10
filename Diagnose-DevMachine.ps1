@@ -10,12 +10,16 @@
     machine already has, to measure real compilation rather than compile-shaped
     I/O. The linked executable is never run.
 .EXAMPLE
+    # Check whether a full run will work here, without measuring anything
+    powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -PreFlight
+.EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Diagnose-DevMachine.ps1 -CompileBench -DefenderTrace
 #>
 [CmdletBinding()]
 param(
+    [switch]$PreFlight,
     [switch]$DefenderTrace,
     [switch]$CompileBench,
     [switch]$LibraryMode,
@@ -1486,10 +1490,192 @@ function Get-DefenderTraceResults {
     }
 }
 
+# ---------- Pre-flight check (-PreFlight) ----------
+
+function Get-PreFlightVerdicts {
+    # Pure: takes the facts, returns verdicts. Answers one question - will a
+    # full run work on this machine, and which parts will be missing - without
+    # measuring anything. Worth having because the two things most likely to
+    # stop the script on a managed machine are policy, not hardware, and
+    # neither is fixed by running elevated.
+    param(
+        [string]$LanguageMode = 'FullLanguage',
+        [string]$MachinePolicy = 'Undefined',
+        [string]$UserPolicy = 'Undefined',
+        [bool]$Elevated = $false,
+        [string]$AmRunningMode = '',
+        [bool]$TraceCmdletPresent = $false,
+        [string]$CompilerName = '',
+        [string]$PSVersion = ''
+    )
+    $results = @()
+
+    if ($LanguageMode -eq 'FullLanguage') {
+        $results += New-DiagResult -Name 'PowerShell language mode' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence @("Language mode: $LanguageMode") -Headline $LanguageMode
+    } else {
+        $results += New-DiagResult -Name 'PowerShell language mode' -Category 'Pre-flight' -Severity 'Problem' `
+            -Evidence @(
+                "Language mode: $LanguageMode (needs FullLanguage)",
+                'WDAC or AppLocker is enforcing Constrained Language Mode. The script uses .NET types and New-Object throughout and will fail almost immediately.',
+                'This is a policy setting, not a privilege one - running elevated does not lift it.'
+            ) -Headline $LanguageMode `
+            -Recommendation 'Ask IT whether this script can be run from an allow-listed path, or have it signed and allow-listed.'
+    }
+
+    $blocking = @('AllSigned', 'Restricted')
+    $policyEvidence = @("MachinePolicy: $MachinePolicy", "UserPolicy: $UserPolicy")
+    if (($blocking -contains $MachinePolicy) -or ($blocking -contains $UserPolicy)) {
+        $offender = if ($blocking -contains $MachinePolicy) { "MachinePolicy=$MachinePolicy" } else { "UserPolicy=$UserPolicy" }
+        $results += New-DiagResult -Name 'Execution policy' -Category 'Pre-flight' -Severity 'Problem' `
+            -Evidence ($policyEvidence + @(
+                'A policy scope set by Group Policy outranks -ExecutionPolicy Bypass, and outranks an elevated session too.'
+            )) -Headline $offender `
+            -Recommendation 'The documented invocation will not run. The script needs signing, or an exception from IT.'
+    } else {
+        $results += New-DiagResult -Name 'Execution policy' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence $policyEvidence -Headline 'not blocked by policy'
+    }
+
+    if ($Elevated) {
+        $results += New-DiagResult -Name 'Elevation' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence @('Running elevated: True') -Headline 'elevated'
+    } else {
+        $results += New-DiagResult -Name 'Elevation' -Category 'Pre-flight' -Severity 'Warning' `
+            -Evidence @(
+                'Running elevated: False',
+                'BitLocker status will be Skipped, the Defender exclusion lists will be unreadable, and -DefenderTrace will not run.'
+            ) -Headline 'not elevated' `
+            -Recommendation 'Re-run from an elevated PowerShell for the full set of checks.'
+    }
+
+    if ($AmRunningMode -eq 'Normal') {
+        $results += New-DiagResult -Name 'Defender running mode' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence @('AMRunningMode: Normal - Defender is the primary scanner, so scan time can be measured.') `
+            -Headline 'Normal'
+    } elseif ($AmRunningMode) {
+        $results += New-DiagResult -Name 'Defender running mode' -Category 'Pre-flight' -Severity 'Warning' `
+            -Evidence @(
+                "AMRunningMode: $AmRunningMode - a third-party agent is the primary scanner.",
+                'Scan time attributable to the build cannot be measured: New-MpPerformanceRecording instruments Defender, and Defender is not the one scanning. There is no equivalent for third-party agents.',
+                'The comparative benchmarks still work - compare them against the reference numbers in the README.'
+            ) -Headline $AmRunningMode
+    } else {
+        $results += New-DiagResult -Name 'Defender running mode' -Category 'Pre-flight' -Severity 'Info' `
+            -Evidence @('Could not determine the Defender running mode on this machine.') -Headline 'unknown'
+    }
+
+    $traceUsable = $TraceCmdletPresent -and $Elevated -and ($AmRunningMode -eq 'Normal')
+    if ($traceUsable) {
+        $results += New-DiagResult -Name '-DefenderTrace' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence @('New-MpPerformanceRecording is available, the session is elevated, and Defender is primary.') `
+            -Headline 'available'
+    } else {
+        $why = @()
+        if (-not $TraceCmdletPresent) { $why += 'New-MpPerformanceRecording not present (needs Windows 10 2004+ with a current Defender platform)' }
+        if (-not $Elevated) { $why += 'not elevated' }
+        if ($AmRunningMode -and $AmRunningMode -ne 'Normal') { $why += "Defender is in $AmRunningMode" }
+        if ($why.Count -eq 0) { $why += 'Defender running mode could not be confirmed' }
+        $results += New-DiagResult -Name '-DefenderTrace' -Category 'Pre-flight' -Severity 'Warning' `
+            -Evidence @("Unavailable: $($why -join '; ')") -Headline 'unavailable'
+    }
+
+    if ($CompilerName) {
+        $results += New-DiagResult -Name '-CompileBench' -Category 'Pre-flight' -Severity 'OK' `
+            -Evidence @("Compiler found: $CompilerName") -Headline $CompilerName
+    } else {
+        $results += New-DiagResult -Name '-CompileBench' -Category 'Pre-flight' -Severity 'Warning' `
+            -Evidence @(
+                'No C++ compiler found on PATH, and no Visual Studio installation via vswhere.',
+                'The compile benchmark would be reported as Skipped. Every other check still runs.'
+            ) -Headline 'no compiler' `
+            -Recommendation 'Run from a Visual Studio developer prompt, or pass -CompileBenchCompiler <path>.'
+    }
+
+    if ($PSVersion) {
+        $results += New-DiagResult -Name 'PowerShell version' -Category 'Pre-flight' -Severity 'Info' `
+            -Evidence @("PowerShell $PSVersion") -Headline $PSVersion
+    }
+
+    $results
+}
+
+function Get-PreFlightResults {
+    $languageMode = [string]$ExecutionContext.SessionState.LanguageMode
+
+    $machinePolicy = 'Undefined'
+    $userPolicy = 'Undefined'
+    try {
+        foreach ($p in (Get-ExecutionPolicy -List -ErrorAction Stop)) {
+            if ($p.Scope -eq 'MachinePolicy') { $machinePolicy = [string]$p.ExecutionPolicy }
+            if ($p.Scope -eq 'UserPolicy') { $userPolicy = [string]$p.ExecutionPolicy }
+        }
+    } catch {
+        # Leave both Undefined; the verdict treats that as not blocking.
+    }
+
+    $amMode = ''
+    try {
+        $status = Get-MpComputerStatus -ErrorAction Stop
+        if ($status.PSObject.Properties['AMRunningMode'] -and $status.AMRunningMode) {
+            $amMode = [string]$status.AMRunningMode
+        } elseif ($status.RealTimeProtectionEnabled) {
+            $amMode = 'Normal'
+        }
+    } catch {
+        # Not Windows, or Defender absent - reported as unknown.
+    }
+
+    $compilerName = ''
+    try { $compilerName = (Resolve-CompileToolchain -Override $CompileBenchCompiler).Name } catch { }
+
+    Get-PreFlightVerdicts `
+        -LanguageMode $languageMode `
+        -MachinePolicy $machinePolicy `
+        -UserPolicy $userPolicy `
+        -Elevated (Test-IsElevated) `
+        -AmRunningMode $amMode `
+        -TraceCmdletPresent ([bool](Get-Command New-MpPerformanceRecording -ErrorAction SilentlyContinue)) `
+        -CompilerName $compilerName `
+        -PSVersion ([string]$PSVersionTable.PSVersion)
+}
+
+function Write-PreFlightSummary {
+    param([Parameter(Mandatory)][object[]]$Results)
+    $colors = @{ Problem = 'Red'; Warning = 'Yellow'; Info = 'Cyan'; OK = 'Green'; Skipped = 'DarkGray' }
+    foreach ($r in ($Results | Sort-Object { $script:SeverityOrder[$_.Severity] })) {
+        Write-Host ('[{0,-7}] {1}: {2}' -f $r.Severity.ToUpper(), $r.Name, (Get-DiagHeadline -Result $r)) `
+            -ForegroundColor $colors[$r.Severity]
+        if ($r.Severity -eq 'Problem' -or $r.Severity -eq 'Warning') {
+            foreach ($e in $r.Evidence) { Write-Host "          $e" -ForegroundColor DarkGray }
+            if ($r.Recommendation) { Write-Host "          -> $($r.Recommendation)" -ForegroundColor DarkGray }
+        }
+    }
+}
+
 # ---------- Entry point ----------
 
 function Invoke-Main {
     $hostName = [System.Environment]::MachineName
+    if ($PreFlight) {
+        Write-Host "Pre-flight check on $hostName - nothing is measured, nothing is written." -ForegroundColor Cyan
+        Write-Host ''
+        $preflight = @(Invoke-DiagCheck -Name 'Pre-flight' -Category 'Pre-flight' -Body { Get-PreFlightResults })
+        Write-PreFlightSummary -Results $preflight
+        Write-Host ''
+        $blockers = @($preflight | Where-Object { $_.Severity -eq 'Problem' })
+        if ($blockers.Count -gt 0) {
+            Write-Host "A full run will NOT work here: $(($blockers | ForEach-Object { $_.Name }) -join ', ')." -ForegroundColor Red
+            exit 1
+        }
+        $degraded = @($preflight | Where-Object { $_.Severity -eq 'Warning' })
+        if ($degraded.Count -gt 0) {
+            Write-Host "Clear to run, with $($degraded.Count) check(s) degraded - see above." -ForegroundColor Yellow
+        } else {
+            Write-Host 'Clear to run, with everything available.' -ForegroundColor Green
+        }
+        exit 0
+    }
     Write-Host "Diagnose-DevMachine on $hostName - read-only diagnostic, ~2 minutes." -ForegroundColor Cyan
     $elevated = Test-IsElevated
     if (-not $elevated) {
