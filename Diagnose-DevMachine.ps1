@@ -134,6 +134,23 @@ function Format-DiagSummary {
     $lines
 }
 
+function Format-DiagMeasurements {
+    # Every benchmark's headline number in one table. Without this a reader has
+    # to hunt through per-check evidence to compare their machine against a
+    # known-good one, which is the main thing people want the numbers for.
+    param([Parameter(Mandatory)][object[]]$Sorted)
+    $bench = @($Sorted | Where-Object { $_.Category -eq 'Benchmark' })
+    if ($bench.Count -eq 0) { return @() }
+    $lines = @('', '## Measurements', '', '| Measurement | Result | Verdict |', '| --- | --- | --- |')
+    foreach ($r in ($bench | Sort-Object Name)) {
+        $headline = (Get-DiagHeadline -Result $r) -replace '\|', '\|'
+        $lines += "| $($r.Name) | $headline | $($r.Severity) |"
+    }
+    $lines += ''
+    $lines += 'Reference numbers from a known-good machine are in the project README.'
+    $lines
+}
+
 function Format-DiagReport {
     param(
         [Parameter(Mandatory)][object[]]$Results,
@@ -155,6 +172,7 @@ function Format-DiagReport {
         ''
     )
     $lines += Format-DiagSummary -Sorted $sorted -ComputerName $ComputerName
+    $lines += Format-DiagMeasurements -Sorted $sorted
     foreach ($sev in 'Problem','Warning','Info','OK','Skipped') {
         $group = @($sorted | Where-Object { $_.Severity -eq $sev })
         if ($group.Count -eq 0) { continue }
@@ -416,13 +434,13 @@ function Get-FileBenchVerdict {
         'Heuristic reference: healthy SSD < 2 ms/file write; heavy AV/EDR scanning commonly shows 5-30 ms/file'
     )
     if ($perFileWriteMs -gt 8) {
-        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence -Headline "$perFileWriteMs ms/file write" `
             -Recommendation 'Small-file writes are far below healthy SSD rates - the signature of per-file security scanning. Request AV/EDR exclusions for build directories and toolchain processes.'
     } elseif ($perFileWriteMs -gt 2) {
-        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence -Headline "$perFileWriteMs ms/file write" `
             -Recommendation 'Small-file writes are slower than a healthy SSD; likely scanning overhead. Compare against the Defender/agent findings above.'
     } else {
-        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+        New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence -Headline "$perFileWriteMs ms/file write"
     }
 }
 
@@ -433,13 +451,13 @@ function Get-SpawnBenchVerdict {
         'Heuristic reference: healthy < 30 ms/spawn; EDR process-hooking overhead commonly shows 100-300 ms/spawn'
     )
     if ($Bench.PerSpawnMs -gt 100) {
-        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence -Headline "$($Bench.PerSpawnMs) ms/spawn" `
             -Recommendation 'Process creation is heavily taxed - typical of EDR hooking every process. Builds spawn thousands of compiler processes; request toolchain process exclusions.'
     } elseif ($Bench.PerSpawnMs -gt 30) {
-        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence -Headline "$($Bench.PerSpawnMs) ms/spawn" `
             -Recommendation 'Process creation is slower than expected; likely agent overhead.'
     } else {
-        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+        New-DiagResult -Name 'Process-spawn benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence -Headline "$($Bench.PerSpawnMs) ms/spawn"
     }
 }
 
@@ -1272,13 +1290,13 @@ function Get-LinkBenchVerdict {
         'Heuristic reference: healthy < 1500 ms for a project this size; > 4000 ms points at scan-on-write of the produced binary'
     )
     if ($Bench.LinkMs -gt 4000) {
-        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence `
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Problem' -Evidence $evidence -Headline "$($Bench.ObjectCount) objects in $($Bench.LinkMs) ms" `
             -Recommendation 'Linking is being heavily penalised. Ask for the build output directory to be excluded from real-time scanning.'
     } elseif ($Bench.LinkMs -gt 1500) {
-        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence `
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'Warning' -Evidence $evidence -Headline "$($Bench.ObjectCount) objects in $($Bench.LinkMs) ms" `
             -Recommendation 'Link times are elevated; excluding the build output directory should help.'
     } else {
-        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence
+        New-DiagResult -Name 'Link benchmark' -Category 'Benchmark' -Severity 'OK' -Evidence $evidence -Headline "$($Bench.ObjectCount) objects in $($Bench.LinkMs) ms"
     }
 }
 

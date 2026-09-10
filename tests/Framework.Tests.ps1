@@ -106,6 +106,25 @@ Describe 'Format-DiagReport' {
         $md | Should -Match '2\. Other fix'
         ([regex]::Matches($md, 'Same fix')).Count | Should -Be 3
     }
+    It 'tabulates every benchmark measurement for comparison' {
+        $results = @(
+            New-DiagResult -Name 'Small-file I/O benchmark' -Category 'Benchmark' -Severity 'OK' `
+                -Evidence @('a long evidence line') -Headline '0.61 ms/file write'
+            New-DiagResult -Name 'Compile throughput' -Category 'Benchmark' -Severity 'Warning' `
+                -Evidence @('a long evidence line') -Headline '441.4 ms/TU with clang-cl'
+            New-DiagResult -Name 'Pending reboot' -Category 'OS' -Severity 'Warning' -Evidence @('x')
+        )
+        $md = Format-DiagReport -Results $results -ComputerName 'TESTBOX' -Timestamp ([datetime]'2026-09-09')
+        $md | Should -Match '## Measurements'
+        $md | Should -Match '\| Measurement \| Result \| Verdict \|'
+        $md | Should -Match '\| Compile throughput \| 441\.4 ms/TU with clang-cl \| Warning \|'
+        $md | Should -Match '\| Small-file I/O benchmark \| 0\.61 ms/file write \| OK \|'
+    }
+    It 'omits the measurements table when nothing was benchmarked' {
+        $results = @(New-DiagResult -Name 'Pending reboot' -Category 'OS' -Severity 'Warning' -Evidence @('x'))
+        $md = Format-DiagReport -Results $results -ComputerName 'TESTBOX' -Timestamp ([datetime]'2026-09-09')
+        $md | Should -Not -Match '## Measurements'
+    }
     It 'names the checks that could not run' {
         $results = @(
             New-DiagResult -Name 'BitLocker' -Category 'Storage' -Severity 'Skipped' -Evidence @('Access denied')
